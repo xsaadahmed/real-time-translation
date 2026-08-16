@@ -1,0 +1,12 @@
+# Higher-quality TTS backends. Neither is required: the pipeline falls back to
+# the Windows SAPI5 backend when these are absent.
+#
+# Kokoro-82M. Best quality/speed tradeoff on CPU, but its G2P wants espeak-ng
+# installed for out-of-vocabulary words:
+#   winget install eSpeak-NG.eSpeak-NG
+# kokoro>=0.9
+# soundfile>=0.12
+#
+# Piper. Needs a voice model downloaded to models/piper/ and RTT_PIPER_VOICE
+# pointed at the .onnx file.
+# piper-tts>=1.2

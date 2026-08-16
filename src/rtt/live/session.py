@@ -1,0 +1,308 @@
+"""Live microphone session with incremental ASR and dual-quality pipelines.
+
+Live updates transcribe only NEW audio (not the entire growing buffer) using a
+fast ASR model. The final pass re-transcribes everything with a larger model
+for accuracy.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+
+from ..audio import resample, save_wav, to_mono_float32
+from ..config import ASR_SAMPLE_RATE
+from ..pipeline import TranslationPipeline
+from ..text import merge_incremental_text, split_sentences
+
+logger = logging.getLogger(__name__)
+
+MIN_AUDIO_SEC = 0.8
+MIN_NEW_AUDIO_SEC = 2.0
+MIN_PROCESS_INTERVAL_SEC = 1.0
+LIVE_CONTEXT_SEC = 3.0
+
+
+@dataclass
+class LiveStreamState:
+    session_id: str = ""
+    audio: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    sample_rate: int = ASR_SAMPLE_RATE
+    arabic_text: str = ""
+    english_text: str = ""
+    status_message: str = "Click the microphone and speak Arabic."
+    processed_samples: int = 0
+    processing: bool = False
+    is_active: bool = False
+    last_process_wall: float = 0.0
+    chunks_received: int = 0
+    arabic_at_last_mt: str = ""
+
+    def duration_sec(self) -> float:
+        if self.audio.size == 0 or self.sample_rate <= 0:
+            return 0.0
+        return float(self.audio.size) / float(self.sample_rate)
+
+    def new_audio_sec(self) -> float:
+        new_samples = self.audio.size - self.processed_samples
+        return float(new_samples) / float(self.sample_rate)
+
+
+def merge_audio(
+    existing: np.ndarray,
+    new_samples: np.ndarray,
+    sample_rate: int,
+) -> np.ndarray:
+    new_mono = resample(to_mono_float32(new_samples), sample_rate, ASR_SAMPLE_RATE)
+    if new_mono.size == 0:
+        return existing
+    if existing.size == 0:
+        return new_mono
+    if new_mono.size > existing.size:
+        return new_mono
+    if new_mono.size == existing.size:
+        probe = min(800, existing.size)
+        if probe > 0 and np.allclose(existing[:probe], new_mono[:probe], atol=0.02):
+            return existing
+        return np.concatenate([existing, new_mono])
+    return np.concatenate([existing, new_mono])
+
+
+class LiveSessionStore:
+    def __init__(
+        self,
+        live_pipeline: TranslationPipeline,
+        final_pipeline_getter: Callable[[], TranslationPipeline],
+    ) -> None:
+        self.live_pipeline = live_pipeline
+        self._get_final_pipeline = final_pipeline_getter
+        self._sessions: dict[str, LiveStreamState] = {}
+        self._lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._processors_running: set[str] = set()
+
+    def create(self) -> LiveStreamState:
+        state = LiveStreamState(
+            session_id=str(uuid.uuid4()),
+            status_message="Listening… speak Arabic.",
+            is_active=True,
+        )
+        with self._lock:
+            self._sessions[state.session_id] = state
+        return state
+
+    def get(self, session_id: str | None) -> LiveStreamState | None:
+        if not session_id:
+            return None
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def remove(self, session_id: str) -> None:
+        with self._lock:
+            self._sessions.pop(session_id, None)
+        self._processors_running.discard(session_id)
+
+    def append_chunk(
+        self,
+        session_id: str,
+        sample_rate: int,
+        samples: np.ndarray,
+    ) -> LiveStreamState | None:
+        state = self.get(session_id)
+        if state is None:
+            return None
+
+        before = state.duration_sec()
+        state.audio = merge_audio(state.audio, samples, sample_rate)
+        state.sample_rate = ASR_SAMPLE_RATE
+        state.chunks_received += 1
+        after = state.duration_sec()
+
+        logger.info(
+            "Chunk #%d: %.2fs -> %.2fs total",
+            state.chunks_received,
+            before,
+            after,
+        )
+        return state
+
+    def start_processor(self, session_id: str) -> None:
+        if session_id in self._processors_running:
+            return
+        self._processors_running.add(session_id)
+        threading.Thread(
+            target=self._processor_loop,
+            args=(session_id,),
+            name=f"live-asr-{session_id[:8]}",
+            daemon=True,
+        ).start()
+
+    def _processor_loop(self, session_id: str) -> None:
+        logger.info("Live processor started for %s", session_id[:8])
+        while True:
+            state = self.get(session_id)
+            if state is None or not state.is_active:
+                break
+
+            now = time.time()
+            should_run = (
+                state.new_audio_sec() >= MIN_NEW_AUDIO_SEC
+                and not state.processing
+                and (now - state.last_process_wall) >= MIN_PROCESS_INTERVAL_SEC
+            )
+
+            if should_run:
+                state.processing = True
+                try:
+                    self._run_live_increment(state)
+                    state.last_process_wall = time.time()
+                except Exception:
+                    logger.exception("Live transcription failed")
+                    state.status_message = "Transcription error — retrying…"
+                finally:
+                    state.processing = False
+
+            time.sleep(0.2)
+
+        self._processors_running.discard(session_id)
+        logger.info("Live processor stopped for %s", session_id[:8])
+
+    def _run_live_increment(self, state: LiveStreamState) -> LiveStreamState:
+        """Transcribe only the new audio since the last pass (fast path)."""
+        context = int(LIVE_CONTEXT_SEC * ASR_SAMPLE_RATE)
+        start = max(0, state.processed_samples - context)
+        chunk = state.audio[start:]
+        chunk_sec = float(chunk.size) / float(ASR_SAMPLE_RATE)
+
+        if chunk_sec < MIN_AUDIO_SEC:
+            state.status_message = f"Listening… ({state.duration_sec():.1f}s captured)"
+            return state
+
+        state.status_message = f"Transcribing… ({state.duration_sec():.1f}s captured)"
+
+        with self._process_lock:
+            arabic_new, _, asr_times = self.live_pipeline.transcribe(chunk, state.sample_rate)
+            if arabic_new:
+                state.arabic_text = merge_incremental_text(state.arabic_text, arabic_new)
+
+            # Advance cursor — we consumed audio up to the current end.
+            state.processed_samples = state.audio.size
+
+            english_text = ""
+            mt_times: dict[str, float] = {}
+            if state.arabic_text:
+                english_delta, mt_times = self._translate_live_delta(state)
+                if english_delta:
+                    state.english_text = merge_incremental_text(
+                        state.english_text, english_delta
+                    )
+                state.arabic_at_last_mt = state.arabic_text
+
+        asr_s = asr_times.get("asr", 0.0)
+        mt_s = mt_times.get("mt", 0.0)
+        state.status_message = (
+            f"Live — {state.duration_sec():.1f}s recorded · "
+            f"chunk {chunk_sec:.1f}s · ASR {asr_s:.1f}s · MT {mt_s:.1f}s"
+        )
+        logger.info(
+            "Live increment %.1fs chunk -> Arabic: %s",
+            chunk_sec,
+            state.arabic_text[:120],
+        )
+        return state
+
+    def _translate_live_delta(self, state: LiveStreamState) -> tuple[str, dict[str, float]]:
+        """Translate only newly recognized Arabic to keep live MT fast on CPU."""
+        full_ar = state.arabic_text
+        prev_ar = state.arabic_at_last_mt
+        if not prev_ar:
+            return self.live_pipeline.translate(full_ar)
+
+        prev_sents = split_sentences(prev_ar)
+        full_sents = split_sentences(full_ar)
+        if len(full_sents) > len(prev_sents):
+            delta_ar = " ".join(full_sents[len(prev_sents):])
+        elif full_ar != prev_ar:
+            # ASR revised earlier words — re-translate the tail for a quick preview.
+            delta_ar = full_ar
+            state.english_text = ""
+        else:
+            return "", {}
+
+        if not delta_ar.strip():
+            return "", {}
+        return self.live_pipeline.translate(delta_ar)
+
+    def _run_final(self, state: LiveStreamState) -> LiveStreamState:
+        """Full-buffer pass with the high-quality model."""
+        duration = state.duration_sec()
+        state.status_message = f"Finalizing {duration:.1f}s with high-quality model…"
+
+        with self._process_lock:
+            final_pipeline = self._get_final_pipeline()
+            arabic_text, _, asr_times = final_pipeline.transcribe(
+                state.audio, state.sample_rate
+            )
+            english_text, mt_times = final_pipeline.translate(arabic_text)
+
+        state.arabic_text = arabic_text
+        state.english_text = english_text
+        state.processed_samples = state.audio.size
+
+        asr_s = asr_times.get("asr", 0.0)
+        mt_s = mt_times.get("mt", 0.0)
+        if arabic_text:
+            state.status_message = (
+                f"Done — {duration:.1f}s · ASR {asr_s:.1f}s · MT {mt_s:.1f}s"
+            )
+            logger.info("Final transcript: %s", arabic_text[:200])
+        else:
+            state.status_message = f"No speech detected in {duration:.1f}s"
+
+        return state
+
+    def finalize(self, session_id: str) -> LiveStreamState | None:
+        state = self.get(session_id)
+        if state is None:
+            return None
+
+        state.is_active = False
+
+        for _ in range(50):
+            if not state.processing:
+                break
+            time.sleep(0.1)
+
+        state.processing = True
+        try:
+            self._run_final(state)
+        finally:
+            state.processing = False
+
+        self.remove(session_id)
+        return state
+
+    def save_debug(self, session_id: str, output_dir: str) -> None:
+        state = self.get(session_id)
+        if state is None or state.audio.size == 0:
+            return
+        from pathlib import Path
+
+        path = Path(output_dir) / f"debug_live_{session_id[:8]}.wav"
+        save_wav(path, state.audio, state.sample_rate)
+        logger.info("Debug audio saved: %s (%.2fs)", path, state.duration_sec())
+
+
+__all__ = [
+    "LiveSessionStore",
+    "LiveStreamState",
+    "MIN_AUDIO_SEC",
+    "MIN_NEW_AUDIO_SEC",
+    "merge_audio",
+]

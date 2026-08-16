@@ -1,0 +1,25 @@
+# Core pipeline dependencies. Everything here runs fully locally on CPU.
+# Models are downloaded once from Hugging Face, then cached; see README for
+# how to run with HF_HUB_OFFLINE=1 afterwards.
+
+numpy>=1.26,<3
+scipy>=1.11
+soundfile>=0.12
+
+# ASR: CTranslate2 Whisper. Pulls in onnxruntime (VAD) and av (audio decode),
+# which is why no ffmpeg binary is required.
+faster-whisper>=1.1.0
+
+# MT: MarianMT / NLLB via transformers.
+torch>=2.2
+transformers>=4.56,<5
+sentencepiece>=0.2
+sacremoses>=0.1
+
+# TTS: Windows SAPI5 backend. Zero download, no espeak-ng needed.
+pyttsx3>=2.90
+
+# UI
+gradio>=4.44
+fastapi>=0.115
+uvicorn[standard]>=0.30
