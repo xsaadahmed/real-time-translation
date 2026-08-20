@@ -9,6 +9,8 @@ Arabic structural analysis the commitment policy will need later.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from functools import lru_cache
 
 # Latin and Arabic sentence terminators. The Arabic question mark (؟) and the
 # Urdu/Arabic full stop (۔) are separate codepoints from their Latin lookalikes.
@@ -156,7 +158,148 @@ def reconcile_provisional(old_provisional: str, new_hypothesis: str) -> tuple[st
     return newly_verified, remaining_provisional
 
 
+
+# ---------------------------------------------------------------------------
+# Structural guards
+#
+# These catch constructions where committing a translation of the observed
+# tail risks being wrong once more Arabic arrives - not because the ASR/MT is
+# uncertain, but because Arabic word order or morphology hasn't disclosed the
+# information English needs yet. See README "Arabic structural guards".
+#
+# Each guard looks only at the tail's last word (the word nearest the commit
+# boundary). Cheap, lexicon-only guards (TAM particles, numerals, dangling
+# proclitics) need no dependency; the POS-dependent guards (VSO subject,
+# iḍāfa) need camel-tools' dictionary Analyzer, loaded lazily and only once.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GuardResult:
+    """Result of a structural-guard check on a candidate commit tail."""
+
+    hold: bool
+    reason: str = ""
+    guard: str = ""
+
+
+# Pre-verbal TAM (tense-aspect-mood) particles: what follows changes the verb
+# tense/negation in English, so committing before it arrives is unrecoverable
+# (e.g. "كان يذهب" = "was going", not "goes"; "لم يذهب" = "did not go").
+_TAM_PARTICLES = {"كان", "كانت", "لم", "قد", "سوف", "لن"}
+
+# Arabic 21-99 are spoken ones-then-tens (واحد وعشرون = "twenty-one"), the
+# reverse of English word order. Emitting "one" before "وعشرون" arrives
+# produces an unrecoverable "one ... twenty" ordering.
+_NUMERAL_ONES = {
+    "واحد", "واحدة", "اثنان", "اثنين", "ثلاثة", "أربعة", "خمسة",
+    "ستة", "سبعة", "ثمانية", "تسعة",
+}
+
+# Single-letter proclitics (و=and, ف=so/then, ب=by/with, ك=like, ل=to/for)
+# that normally attach to the following word. A standalone one-letter token
+# means the word it belongs to hasn't been heard/segmented yet.
+_DANGLING_PROCLITICS = {"و", "ف", "ب", "ك", "ل"}
+
+_DEFINITE_PREFIX = "ال"
+
+_CAMEL_DB_NAME = "calima-msa-r13"
+
+
+def _guard_tam_particle(last_word: str) -> GuardResult:
+    if last_word in _TAM_PARTICLES:
+        return GuardResult(True, f"'{last_word}' sets up a verb not yet heard", "tam_particle")
+    return GuardResult(False)
+
+
+def _guard_partial_numeral(last_word: str) -> GuardResult:
+    if last_word in _NUMERAL_ONES:
+        return GuardResult(
+            True, f"'{last_word}' may be the ones-digit of a compound number", "partial_numeral"
+        )
+    return GuardResult(False)
+
+
+def _guard_dangling_proclitic(last_word: str) -> GuardResult:
+    if last_word in _DANGLING_PROCLITICS:
+        return GuardResult(
+            True, f"'{last_word}' is a proclitic awaiting its host word", "dangling_proclitic"
+        )
+    return GuardResult(False)
+
+
+@lru_cache(maxsize=1)
+def _camel_analyzer():
+    """Lazily load camel-tools' dictionary-based Analyzer (not the neural
+    disambiguator - too slow for the live hot loop). Cached process-wide
+    since loading the morphology database takes real time.
+    """
+    from camel_tools.morphology.analyzer import Analyzer
+    from camel_tools.morphology.database import MorphologyDB
+
+    db = MorphologyDB.builtin_db(db_name=_CAMEL_DB_NAME, flags="a")
+    return Analyzer(db)
+
+
+def _guard_vso_no_subject(last_word: str) -> GuardResult:
+    """Arabic is VSO: a bare verb with no subject yet may still need one,
+    and committing an English subject (or subjectless form) risks being
+    wrong once the real subject arrives.
+    """
+    analyses = _camel_analyzer().analyze(last_word)
+    if any(a.get("pos") == "verb" for a in analyses):
+        return GuardResult(
+            True, f"'{last_word}' analyzes as a verb with no subject yet", "vso_no_subject"
+        )
+    return GuardResult(False)
+
+
+def _guard_idafa_head(last_word: str) -> GuardResult:
+    """A bare (non-definite) noun that can be read in construct state (stt
+    'c') may be the head of an iḍāfa chain still awaiting its genitive
+    noun - "بيت" alone vs "بيت الرجل" ("a house" vs "the man's house").
+    Definite nouns (ال-prefixed) can't head an iḍāfa, so they're exempt.
+    """
+    if last_word.startswith(_DEFINITE_PREFIX):
+        return GuardResult(False)
+    analyses = _camel_analyzer().analyze(last_word)
+    if any(a.get("pos") == "noun" and a.get("stt") == "c" for a in analyses):
+        return GuardResult(
+            True, f"'{last_word}' may head an iḍāfa chain not yet complete", "idafa_head"
+        )
+    return GuardResult(False)
+
+
+# Cheapest first: lexicon-only guards run before the morphology-backed ones.
+_GUARDS = (
+    _guard_tam_particle,
+    _guard_partial_numeral,
+    _guard_dangling_proclitic,
+    _guard_vso_no_subject,
+    _guard_idafa_head,
+)
+
+
+def check_structural_guards(text: str) -> GuardResult:
+    """Check whether the tail of ``text`` sits in a hazardous Arabic
+    construction that should hold back commitment. Only the last word is
+    examined - it is the word nearest the commit boundary.
+    """
+    text = normalize_arabic(text)
+    if not text:
+        return GuardResult(False)
+
+    last_word = text.split()[-1]
+    for guard in _GUARDS:
+        result = guard(last_word)
+        if result.hold:
+            return result
+    return GuardResult(False)
+
+
 __all__ = [
+    "GuardResult",
+    "check_structural_guards",
     "chunk_for_translation",
     "join_translations",
     "merge_incremental_text",
