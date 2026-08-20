@@ -202,7 +202,9 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Cascade ASR → MT → TTS | ✅ Whisper + Marian/NLLB |
 | Live incremental mic path | ✅ fast live + accurate final on stop |
 | Production UI (speculative text UX) | ✅ Next.js; candidates cosmetic until commitment engine |
-| Draft-and-verify dual ASR lanes | 🔲 |
+| Verified vs provisional Arabic (live lane) | ✅ `reconcile_provisional()` in `text.py` + session split |
+| Production UI wired to verified/provisional | 🔲 WS fields exist; UI still animates from combined `english` |
+| Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
 | Branched translator + risk model | 🔲 |
 | Arabic structural guards | 🔲 partial (`text.py` scaffolding) |
 | Seamless second opinion | 🔲 |
@@ -260,7 +262,7 @@ scripts/                  Model download, smoke tests
 ## Extension points (mapped to target arch)
 
 - `asr.base.ASREngine` — draft lane (`transcribe_chunk`) + verify lane (full re-decode).
-- `live/session.py` — evolve into Arabic state with verified vs provisional tokens.
+- `live/session.py` — verified vs provisional Arabic/English; parallel verify lane still TODO.
 - `text.py` — structural guards (VSO, *iḍāfa*, numerals, TAM, proclitics).
 - `mt.base.Translator` — branched batched translation with shared prefix + committed EN prefill.
 - New `commit/` module — risk model, lag governor, commit policy.
