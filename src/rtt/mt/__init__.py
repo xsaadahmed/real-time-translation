@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..config import MTConfig
+from .agreement import AgreementResult, agreement_depth, default_quorum
 from .base import Translator
 from .huggingface import DEFAULT_MODELS, HuggingFaceTranslator
 
@@ -12,4 +13,12 @@ def build_translator(config: MTConfig | None = None) -> Translator:
     return HuggingFaceTranslator(config or MTConfig())
 
 
-__all__ = ["DEFAULT_MODELS", "HuggingFaceTranslator", "Translator", "build_translator"]
+__all__ = [
+    "AgreementResult",
+    "DEFAULT_MODELS",
+    "HuggingFaceTranslator",
+    "Translator",
+    "agreement_depth",
+    "build_translator",
+    "default_quorum",
+]

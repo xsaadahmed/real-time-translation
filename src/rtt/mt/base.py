@@ -34,5 +34,30 @@ class Translator(ABC):
             return ""
         return join_translations(self.translate_batch(chunks))
 
+    def translate_branches(self, observed: str, futures: list[str]) -> list[str]:
+        """Translate the observed-only branch plus one branch per sampled
+        Arabic future, as a single batched call (README "Branched translator").
+
+        ``futures`` are short sampled continuations of ``observed`` (from the
+        0.5B Arabic futures model, not yet implemented). Returns ``len(futures)
+        + 1`` English translations: index 0 is the observed-only branch,
+        indices 1..K correspond to ``futures`` in order.
+
+        This base implementation is the CPU / no-shared-KV-prefix baseline -
+        it just batches K+1 independent short strings through translate_batch,
+        with no speculative-decoding speedup. It exists to let the branch-
+        agreement scoring (see agreement.py) be validated against the current
+        Marian/NLLB backend now, on hardware with no GPU, well before the
+        target Qwen3 + vLLM + EAGLE-3 + shared-KV-prefix setup is available.
+        A backend with a real shared prefix can override this method without
+        changing what callers see.
+        """
+        observed = observed.strip()
+        branch_texts = [observed] + [
+            f"{observed} {future}".strip() if future.strip() else observed
+            for future in futures
+        ]
+        return self.translate_batch(branch_texts)
+
 
 __all__ = ["Translator"]
