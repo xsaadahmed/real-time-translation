@@ -32,7 +32,7 @@ RUN mkdir -p /app/models /app/outputs
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${RTT_API_PORT}/health" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${RTT_API_PORT}/ready" || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "python -m uvicorn rtt.api.production_server:app --host \"${RTT_API_HOST:-0.0.0.0}\" --port \"${RTT_API_PORT:-8765}\""]

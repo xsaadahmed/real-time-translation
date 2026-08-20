@@ -213,6 +213,8 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Cloned-voice streaming TTS | 🔲 target (CosyVoice2) |
 | Production packaging (Docker + HTTPS) | ✅ Compose + Caddy reverse proxy |
 | CI | ✅ pytest + production-ui build on GitHub Actions |
+| Session UX (reconnect, finalize, selectors) | ✅ WS reconnect, progress, empty/error, model selectors |
+| Ops (logs, metrics, readiness) | ✅ JSON logs, `/metrics`, `/ready` gate |
 
 ---
 
@@ -294,7 +296,10 @@ docker compose up -d --build
 | --- | --- |
 | `https://<RTT_PUBLIC_HOST>/` | Production UI |
 | `wss://<RTT_PUBLIC_HOST>/ws` | Live interpreter WebSocket (auto-used by UI) |
-| `https://<RTT_PUBLIC_HOST>/health` | API health check |
+| `https://<RTT_PUBLIC_HOST>/health` | Liveness (process up) |
+| `https://<RTT_PUBLIC_HOST>/ready` | Readiness (models loaded) — Compose waits on this |
+| `https://<RTT_PUBLIC_HOST>/metrics` | Session / finalize latency counters |
+| `https://<RTT_PUBLIC_HOST>/config` | Live/final model config (GET/PUT) |
 | `http://localhost:8080/` | Plain HTTP (no TLS), for quick local checks |
 
 **First boot** downloads ASR/MT models into the `rtt-models` volume and can take several minutes. Model cache persists across restarts.

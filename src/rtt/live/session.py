@@ -127,6 +127,10 @@ class LiveSessionStore:
             self._sessions.pop(session_id, None)
         self._processors_running.discard(session_id)
 
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(1 for state in self._sessions.values() if state.is_active)
+
     def append_chunk(
         self,
         session_id: str,

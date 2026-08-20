@@ -112,6 +112,34 @@ def get_store() -> LiveSessionStore:
     return _store
 
 
+def reset_store() -> None:
+    """Drop cached pipelines so the next get_store() rebuilds from env."""
+    global _store, _live_pipeline, _final_pipeline, _config
+    with _init_lock:
+        _store = None
+        _live_pipeline = None
+        _final_pipeline = None
+        _config = PipelineConfig()
+
+
+def active_session_count() -> int:
+    store = _store
+    if store is None:
+        return 0
+    return store.active_count()
+
+
+def describe_runtime_config() -> dict[str, str]:
+    live_cfg = _live_config()
+    final_cfg = _final_config()
+    return {
+        "live_asr": live_cfg.asr.model_size,
+        "live_mt": live_cfg.mt.backend,
+        "final_asr": final_cfg.asr.model_size,
+        "final_mt": final_cfg.mt.backend,
+    }
+
+
 def _display_for_session(session_id: str | None) -> tuple[str, str, str, str]:
     store = get_store()
 

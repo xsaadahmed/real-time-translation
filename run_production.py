@@ -150,10 +150,15 @@ def _cleanup_stale_next_dev() -> None:
 
 def _api_healthy(port: int) -> bool:
     try:
-        with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=1.5) as resp:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/ready", timeout=1.5) as resp:
             return resp.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
-        return False
+        # Fall back to liveness while models are still loading
+        try:
+            with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=1.5) as resp:
+                return resp.status == 200
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return False
 
 
 def _ui_healthy(port: int) -> bool:

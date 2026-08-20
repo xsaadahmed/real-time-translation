@@ -6,6 +6,7 @@ type Props = {
   verified: string
   provisional: string
   showCaret: boolean
+  idleHint?: string
 }
 
 function Caret() {
@@ -20,7 +21,7 @@ function Caret() {
 /**
  * English translation: black = verified (committed), grey = provisional preview.
  */
-export function TranslationText({ verified, provisional, showCaret }: Props) {
+export function TranslationText({ verified, provisional, showCaret, idleHint }: Props) {
   const endRef = useRef<HTMLDivElement>(null)
   const hasContent = verified || provisional || showCaret
 
@@ -35,7 +36,7 @@ export function TranslationText({ verified, provisional, showCaret }: Props) {
     return (
       <div className="flex w-full max-w-4xl flex-col">
         <p className={`${textClass} text-prediction opacity-40`}>
-          English translation appears here.
+          {idleHint || 'English translation appears here.'}
         </p>
         <div ref={endRef} />
       </div>

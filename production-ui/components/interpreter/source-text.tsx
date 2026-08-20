@@ -3,9 +3,10 @@
 type Props = {
   verified: string
   provisional: string
+  idleHint?: string
 }
 
-export function SourceText({ verified, provisional }: Props) {
+export function SourceText({ verified, provisional, idleHint }: Props) {
   const hasContent = verified || provisional
 
   return (
@@ -22,7 +23,9 @@ export function SourceText({ verified, provisional }: Props) {
           {provisional && <span className="text-prediction">{provisional}</span>}
         </p>
       ) : (
-        <p className="text-hint opacity-40">&nbsp;</p>
+        <p className="text-hint opacity-40">
+          {idleHint || 'Arabic speech appears here.'}
+        </p>
       )}
     </div>
   )

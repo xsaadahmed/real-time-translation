@@ -12,6 +12,18 @@
 		reverse_proxy api:8765
 	}
 
+	handle /ready {
+		reverse_proxy api:8765
+	}
+
+	handle /metrics {
+		reverse_proxy api:8765
+	}
+
+	handle /config* {
+		reverse_proxy api:8765
+	}
+
 	# Next.js production UI
 	handle {
 		reverse_proxy ui:3000
@@ -24,6 +36,15 @@
 		reverse_proxy api:8765
 	}
 	handle /health {
+		reverse_proxy api:8765
+	}
+	handle /ready {
+		reverse_proxy api:8765
+	}
+	handle /metrics {
+		reverse_proxy api:8765
+	}
+	handle /config* {
 		reverse_proxy api:8765
 	}
 	handle {

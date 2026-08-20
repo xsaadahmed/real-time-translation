@@ -3,7 +3,7 @@
 import { motion } from 'motion/react'
 
 type Props = {
-  mode: 'idle' | 'connecting' | 'listening' | 'finalizing'
+  mode: 'idle' | 'connecting' | 'listening' | 'reconnecting' | 'finalizing'
   disabled?: boolean
   onToggle: () => void
 }
@@ -12,11 +12,13 @@ const LABELS: Record<Props['mode'], string> = {
   idle: 'Start',
   connecting: 'Connecting',
   listening: 'Stop',
+  reconnecting: 'Reconnecting',
   finalizing: 'Processing',
 }
 
 export function RecordingIndicator({ mode, disabled, onToggle }: Props) {
   const active = mode === 'listening'
+  const pulse = mode === 'listening' || mode === 'reconnecting'
   const label = LABELS[mode]
 
   return (
@@ -28,7 +30,7 @@ export function RecordingIndicator({ mode, disabled, onToggle }: Props) {
       className="group flex items-center gap-2 text-sm text-hint transition-colors hover:text-ink focus-visible:outline-none focus-visible:text-ink disabled:opacity-50 disabled:pointer-events-none"
     >
       <span className="relative flex h-2 w-2 items-center justify-center">
-        {active && (
+        {pulse && (
           <motion.span
             className="absolute inline-flex h-2 w-2 rounded-full bg-ink"
             initial={{ opacity: 0.5, scale: 1 }}
@@ -38,7 +40,7 @@ export function RecordingIndicator({ mode, disabled, onToggle }: Props) {
         )}
         <span
           className={
-            active
+            active || mode === 'reconnecting'
               ? 'inline-flex h-2 w-2 rounded-full bg-ink'
               : 'inline-flex h-2 w-2 rounded-full border border-current'
           }
