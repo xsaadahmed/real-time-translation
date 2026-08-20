@@ -30,6 +30,9 @@ gradio>=4.44
 fastapi>=0.115
 uvicorn[standard]>=0.30
 
+# Tests (CI + local)
+pytest>=8.0
+
 # Second opinion (opt-in, off by default - RTT_SECOND_OPINION_ENABLED=1):
 # independent Seamless ar->en channel via transformers (already listed
 # above). No extra package needed, but the smallest usable checkpoint

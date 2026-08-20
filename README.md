@@ -201,7 +201,7 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | --- | --- |
 | Cascade ASR → MT → TTS | ✅ Whisper + Marian/NLLB |
 | Live incremental mic path | ✅ fast live + accurate final on stop |
-| Production UI (speculative text UX) | ✅ Next.js; candidates cosmetic until commitment engine |
+| Production UI (speculative text UX) | ✅ Next.js; black = verified, grey = provisional |
 | Verified vs provisional Arabic (live lane) | ✅ `reconcile_provisional()` in `text.py` + session split |
 | Production UI wired to verified/provisional | ✅ black = verified, grey = provisional, live WebSocket |
 | Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
@@ -212,26 +212,31 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Speculative TTS + jitter buffer | 🔲 |
 | Cloned-voice streaming TTS | 🔲 target (CosyVoice2) |
 | Production packaging (Docker + HTTPS) | ✅ Compose + Caddy reverse proxy |
+| CI | ✅ pytest + production-ui build on GitHub Actions |
 
 ---
 
-## Quick start (current prototype)
+## How to run
+
+The interpreter is the **Next.js production UI** plus the WebSocket API. Gradio is not the product.
+
+Python **3.12** is the supported version (matches Docker and CI). Node.js is required for local UI.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python scripts/download_models.py
-python scripts/smoke_test.py
 
-# Dev UI — http://127.0.0.1:7860
-python run_ui.py
-
-# Production UI — http://127.0.0.1:3000 (requires Node.js)
+# Interpreter — http://127.0.0.1:3000 (requires Node.js)
 python run_production.py
 ```
 
-`run_production.py` auto-picks free ports, clears stale dev servers, and writes the WebSocket URL for the UI.
+`run_production.py` starts the API and UI, auto-picks free ports, and writes the WebSocket URL for the browser.
+
+```powershell
+pytest tests/
+```
 
 ---
 
@@ -302,8 +307,8 @@ $env:RTT_NLLB_SOURCE_LANG="apc_Arab"
 ## Project layout
 
 ```
-run_production.py         Local dev launcher (Next.js dev + API)
-run_ui.py                 Gradio dev UI
+run_production.py         Interpreter launcher (Next.js + API) — use this
+run_ui.py                 Debug-only Gradio scratch UI (not the product)
 docker-compose.yml        Production stack (api + ui + Caddy HTTPS)
 docker/                   Dockerfiles, Caddyfile, entrypoints
 production-ui/            Interpreter interface (grey/black text UX)
@@ -328,3 +333,9 @@ scripts/                  Model download, smoke tests
 - `mt.base.Translator` — branched batched translation with shared prefix + committed EN prefill.
 - New `commit/` module — risk model, lag governor, commit policy.
 - `tts/` — speculative shadow buffer + jitter-buffered playback.
+
+---
+
+## Debug only (Gradio)
+
+`python run_ui.py` launches a leftover Gradio page at http://127.0.0.1:7860. Use it for pipeline debugging, not as the interpreter. The supported local entrypoint is `python run_production.py`.

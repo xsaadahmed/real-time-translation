@@ -1,4 +1,6 @@
-"""Launch the local web UI.
+"""Debug-only Gradio scratch UI. Not the product.
+
+Use ``python run_production.py`` (or Docker) to run the interpreter.
 
     python run_ui.py
     python run_ui.py --asr-model large-v3 --mt-backend nllb
@@ -17,7 +19,12 @@ from rtt.ui.gradio_app import launch  # noqa: E402
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Arabic to English live speech translation UI")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Debug-only Gradio UI. For the real interpreter use "
+            "`python run_production.py` or Docker."
+        )
+    )
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument(
         "--asr-model",
@@ -31,6 +38,12 @@ def main() -> None:
         help="default: nllb for better Arabic→English quality",
     )
     args = parser.parse_args()
+
+    print(
+        "Gradio debug UI only — not the production interpreter.\n"
+        "Use `python run_production.py` (http://127.0.0.1:3000) or Docker.",
+        file=sys.stderr,
+    )
 
     config = PipelineConfig()
     if args.asr_model:
