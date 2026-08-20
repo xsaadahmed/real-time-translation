@@ -47,11 +47,37 @@ def download_tts(config: PipelineConfig) -> None:
     print(f"[tts] using '{engine.name}'")
 
 
+def download_camel_data() -> None:
+    """Fetch the dictionary-based MSA morphology database used by the Arabic
+    structural guards (text.py). Deliberately NOT the neural disambiguator
+    (disambig-*) or dialect/BERT models — those are too slow for the 240ms
+    live hot loop; a plain dictionary lookup is enough for POS candidates.
+    """
+    import subprocess
+
+    from camel_tools.morphology.database import MorphologyDB
+
+    print("[camel-tools] checking for 'calima-msa-r13' morphology database ...")
+    try:
+        MorphologyDB.builtin_db(db_name="calima-msa-r13", flags="a")
+        print("[camel-tools] already installed")
+        return
+    except FileNotFoundError:
+        pass
+
+    subprocess.run(
+        [sys.executable, "-m", "camel_tools.cli.camel_data", "-i", "morphology-db-msa-r13"],
+        check=True,
+    )
+    print("[camel-tools] done")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pre-download models for offline use")
     parser.add_argument("--asr-model", default=None)
     parser.add_argument("--mt-backend", default=None, choices=["marian", "nllb"])
     parser.add_argument("--skip-tts", action="store_true")
+    parser.add_argument("--skip-camel-data", action="store_true")
     args = parser.parse_args()
 
     config = PipelineConfig()
@@ -65,6 +91,8 @@ def main() -> int:
     download_mt(config)
     if not args.skip_tts:
         download_tts(config)
+    if not args.skip_camel_data:
+        download_camel_data()
 
     print("\nAll models cached. You can now run with HF_HUB_OFFLINE=1.")
     return 0

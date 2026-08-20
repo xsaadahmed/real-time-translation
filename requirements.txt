@@ -19,6 +19,12 @@ sacremoses>=0.1
 # TTS: Windows SAPI5 backend. Zero download, no espeak-ng needed.
 pyttsx3>=2.90
 
+# Arabic morphology for the structural guards in text.py (VSO, iḍāfa, TAM,
+# proclitics). Dictionary-based Analyzer only - the neural disambiguator is
+# too slow for the 240ms live hot loop. Run `python scripts/download_models.py`
+# (or `camel_data -i morphology-db-msa-r13`) to fetch the ~40MB dictionary.
+camel-tools>=1.5
+
 # UI
 gradio>=4.44
 fastapi>=0.115
