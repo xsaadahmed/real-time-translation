@@ -19,7 +19,7 @@ import numpy as np
 from ..audio import resample, save_wav, to_mono_float32
 from ..config import ASR_SAMPLE_RATE
 from ..pipeline import TranslationPipeline
-from ..text import merge_incremental_text, split_sentences
+from ..text import merge_incremental_text, reconcile_provisional
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +34,27 @@ class LiveStreamState:
     session_id: str = ""
     audio: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     sample_rate: int = ASR_SAMPLE_RATE
-    arabic_text: str = ""
-    english_text: str = ""
+    # Verified spans are immutable once written - only ever appended to.
+    # Provisional spans cover the still-being-re-transcribed tail and are
+    # wholesale replaced every live pass. See text.reconcile_provisional.
+    arabic_verified: str = ""
+    arabic_provisional: str = ""
+    english_verified: str = ""
+    english_provisional: str = ""
     status_message: str = "Click the microphone and speak Arabic."
     processed_samples: int = 0
     processing: bool = False
     is_active: bool = False
     last_process_wall: float = 0.0
     chunks_received: int = 0
-    arabic_at_last_mt: str = ""
+
+    @property
+    def arabic_text(self) -> str:
+        return " ".join(p for p in (self.arabic_verified, self.arabic_provisional) if p)
+
+    @property
+    def english_text(self) -> str:
+        return " ".join(p for p in (self.english_verified, self.english_provisional) if p)
 
     def duration_sec(self) -> float:
         if self.audio.size == 0 or self.sample_rate <= 0:
@@ -188,21 +200,38 @@ class LiveSessionStore:
 
         with self._process_lock:
             arabic_new, _, asr_times = self.live_pipeline.transcribe(chunk, state.sample_rate)
-            if arabic_new:
-                state.arabic_text = merge_incremental_text(state.arabic_text, arabic_new)
+            newly_verified_ar, provisional_ar = reconcile_provisional(
+                state.arabic_provisional, arabic_new
+            )
+            if newly_verified_ar:
+                state.arabic_verified = merge_incremental_text(
+                    state.arabic_verified, newly_verified_ar
+                )
+            state.arabic_provisional = provisional_ar
 
             # Advance cursor — we consumed audio up to the current end.
             state.processed_samples = state.audio.size
 
-            english_text = ""
             mt_times: dict[str, float] = {}
-            if state.arabic_text:
-                english_delta, mt_times = self._translate_live_delta(state)
-                if english_delta:
-                    state.english_text = merge_incremental_text(
-                        state.english_text, english_delta
+            if newly_verified_ar:
+                # Verified Arabic never changes again, so its translation is
+                # final too — translate once and append permanently.
+                verified_en, verified_mt_times = self.live_pipeline.translate(newly_verified_ar)
+                if verified_en:
+                    state.english_verified = merge_incremental_text(
+                        state.english_verified, verified_en
                     )
-                state.arabic_at_last_mt = state.arabic_text
+                mt_times.update(verified_mt_times)
+            if state.arabic_provisional:
+                # Provisional Arabic can still change, so its translation is
+                # always retranslated from scratch and fully replaced.
+                provisional_en, provisional_mt_times = self.live_pipeline.translate(
+                    state.arabic_provisional
+                )
+                state.english_provisional = provisional_en
+                mt_times.update(provisional_mt_times)
+            else:
+                state.english_provisional = ""
 
         asr_s = asr_times.get("asr", 0.0)
         mt_s = mt_times.get("mt", 0.0)
@@ -217,28 +246,6 @@ class LiveSessionStore:
         )
         return state
 
-    def _translate_live_delta(self, state: LiveStreamState) -> tuple[str, dict[str, float]]:
-        """Translate only newly recognized Arabic to keep live MT fast on CPU."""
-        full_ar = state.arabic_text
-        prev_ar = state.arabic_at_last_mt
-        if not prev_ar:
-            return self.live_pipeline.translate(full_ar)
-
-        prev_sents = split_sentences(prev_ar)
-        full_sents = split_sentences(full_ar)
-        if len(full_sents) > len(prev_sents):
-            delta_ar = " ".join(full_sents[len(prev_sents):])
-        elif full_ar != prev_ar:
-            # ASR revised earlier words — re-translate the tail for a quick preview.
-            delta_ar = full_ar
-            state.english_text = ""
-        else:
-            return "", {}
-
-        if not delta_ar.strip():
-            return "", {}
-        return self.live_pipeline.translate(delta_ar)
-
     def _run_final(self, state: LiveStreamState) -> LiveStreamState:
         """Full-buffer pass with the high-quality model."""
         duration = state.duration_sec()
@@ -251,8 +258,11 @@ class LiveSessionStore:
             )
             english_text, mt_times = final_pipeline.translate(arabic_text)
 
-        state.arabic_text = arabic_text
-        state.english_text = english_text
+        # Full-buffer high-quality pass supersedes any provisional guesses.
+        state.arabic_verified = arabic_text
+        state.arabic_provisional = ""
+        state.english_verified = english_text
+        state.english_provisional = ""
         state.processed_samples = state.audio.size
 
         asr_s = asr_times.get("asr", 0.0)

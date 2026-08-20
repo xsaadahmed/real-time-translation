@@ -92,7 +92,13 @@ def join_translations(pieces: list[str]) -> str:
 
 
 def merge_incremental_text(existing: str, new: str) -> str:
-    """Append new ASR text, merging overlapping words at the boundary."""
+    """Append new ASR text, merging overlapping words at the boundary.
+
+    Append-only: this has no way to correct earlier words if a later ASR
+    pass revises them. Only safe to use on text that is already verified
+    (immutable) and therefore only ever grows. For a mutable, re-transcribed
+    tail, use :func:`reconcile_provisional` instead.
+    """
     existing = normalize_arabic(existing)
     new = normalize_arabic(new)
     if not existing:
@@ -109,10 +115,52 @@ def merge_incremental_text(existing: str, new: str) -> str:
     return f"{existing} {new}"
 
 
+def reconcile_provisional(old_provisional: str, new_hypothesis: str) -> tuple[str, str]:
+    """Reconcile a fresh ASR hypothesis against the previous provisional tail.
+
+    Live ASR re-transcribes a sliding window of recent audio on every pass,
+    so ``new_hypothesis`` covers roughly the same audio as ``old_provisional``
+    plus whatever was newly recorded, and may revise any word in that window
+    (streaming Whisper does this constantly). Two independent passes producing
+    the same word at the same position is exactly the "drafter and verifier
+    agree across two consecutive frames" signal the commitment policy needs,
+    so that leading run of agreement is promoted to verified; everything from
+    the first disagreement onward is still liable to change and stays
+    provisional, replacing the old guess outright (never appended to it).
+
+    Matching is whole-word: a word that differs only by a suffix (``كتاب``
+    vs ``كتابه``) does not match and is correctly kept provisional rather
+    than verified as a partial word.
+
+    Returns ``(newly_verified, remaining_provisional)``.
+    """
+    old_provisional = normalize_arabic(old_provisional)
+    new_hypothesis = normalize_arabic(new_hypothesis)
+    if not old_provisional:
+        return "", new_hypothesis
+    if not new_hypothesis:
+        # This pass heard nothing new (e.g. a silent gap) - nothing new to
+        # confirm, and no reason to discard the previous best guess.
+        return "", old_provisional
+
+    old_words = old_provisional.split()
+    new_words = new_hypothesis.split()
+    agree = 0
+    for old_word, new_word in zip(old_words, new_words):
+        if old_word != new_word:
+            break
+        agree += 1
+
+    newly_verified = " ".join(new_words[:agree])
+    remaining_provisional = " ".join(new_words[agree:])
+    return newly_verified, remaining_provisional
+
+
 __all__ = [
     "chunk_for_translation",
     "join_translations",
     "merge_incremental_text",
     "normalize_arabic",
+    "reconcile_provisional",
     "split_sentences",
 ]
