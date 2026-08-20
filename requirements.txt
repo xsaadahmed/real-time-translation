@@ -19,6 +19,11 @@ sacremoses>=0.1
 # TTS: Windows SAPI5 backend. Zero download, no espeak-ng needed.
 pyttsx3>=2.90
 
+# Commit-risk model (step 8): small calibrated gradient-boosted classifier
+# trained on step 7's harvested labels. CPU, sub-millisecond inference.
+scikit-learn>=1.4
+joblib>=1.3
+
 # Arabic morphology for the structural guards in text.py (VSO, iḍāfa, TAM,
 # proclitics). Dictionary-based Analyzer only - the neural disambiguator is
 # too slow for the 240ms live hot loop. Run `python scripts/download_models.py`
