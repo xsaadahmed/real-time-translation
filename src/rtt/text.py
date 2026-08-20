@@ -8,9 +8,12 @@ Arabic structural analysis the commitment policy will need later.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 # Latin and Arabic sentence terminators. The Arabic question mark (؟) and the
 # Urdu/Arabic full stop (۔) are separate codepoints from their Latin lookalikes.
@@ -205,6 +208,12 @@ _DEFINITE_PREFIX = "ال"
 
 _CAMEL_DB_NAME = "calima-msa-r13"
 
+_CAMEL_INSTALL_HINT = (
+    "Install optional morphology guards with: "
+    "pip install -r requirements-guards.txt && "
+    "python scripts/download_models.py --camel-data-only"
+)
+
 
 def _guard_tam_particle(last_word: str) -> GuardResult:
     if last_word in _TAM_PARTICLES:
@@ -230,15 +239,39 @@ def _guard_dangling_proclitic(last_word: str) -> GuardResult:
 
 @lru_cache(maxsize=1)
 def _camel_analyzer():
-    """Lazily load camel-tools' dictionary-based Analyzer (not the neural
-    disambiguator - too slow for the live hot loop). Cached process-wide
-    since loading the morphology database takes real time.
-    """
-    from camel_tools.morphology.analyzer import Analyzer
-    from camel_tools.morphology.database import MorphologyDB
+    """Lazily load camel-tools' dictionary Analyzer, or None if unavailable.
 
-    db = MorphologyDB.builtin_db(db_name=_CAMEL_DB_NAME, flags="a")
+    Morphology (VSO / iḍāfa) guards are optional: missing package or DB must
+    not crash the live path. Lexicon-only guards still run. The neural
+    disambiguator is intentionally not used — too slow for the live hot loop.
+    """
+    try:
+        from camel_tools.morphology.analyzer import Analyzer
+        from camel_tools.morphology.database import MorphologyDB
+    except ImportError:
+        logger.warning(
+            "camel-tools is not installed; VSO/iḍāfa guards disabled. %s",
+            _CAMEL_INSTALL_HINT,
+        )
+        return None
+
+    try:
+        db = MorphologyDB.builtin_db(db_name=_CAMEL_DB_NAME, flags="a")
+    except FileNotFoundError:
+        logger.warning(
+            "camel-tools morphology database '%s' is missing; "
+            "VSO/iḍāfa guards disabled. %s",
+            _CAMEL_DB_NAME,
+            _CAMEL_INSTALL_HINT,
+        )
+        return None
+
     return Analyzer(db)
+
+
+def camel_morphology_available() -> bool:
+    """True when camel-tools and the dictionary morphology DB can load."""
+    return _camel_analyzer() is not None
 
 
 def _guard_vso_no_subject(last_word: str) -> GuardResult:
@@ -246,7 +279,10 @@ def _guard_vso_no_subject(last_word: str) -> GuardResult:
     and committing an English subject (or subjectless form) risks being
     wrong once the real subject arrives.
     """
-    analyses = _camel_analyzer().analyze(last_word)
+    analyzer = _camel_analyzer()
+    if analyzer is None:
+        return GuardResult(False)
+    analyses = analyzer.analyze(last_word)
     if any(a.get("pos") == "verb" for a in analyses):
         return GuardResult(
             True, f"'{last_word}' analyzes as a verb with no subject yet", "vso_no_subject"
@@ -262,7 +298,10 @@ def _guard_idafa_head(last_word: str) -> GuardResult:
     """
     if last_word.startswith(_DEFINITE_PREFIX):
         return GuardResult(False)
-    analyses = _camel_analyzer().analyze(last_word)
+    analyzer = _camel_analyzer()
+    if analyzer is None:
+        return GuardResult(False)
+    analyses = analyzer.analyze(last_word)
     if any(a.get("pos") == "noun" and a.get("stt") == "c" for a in analyses):
         return GuardResult(
             True, f"'{last_word}' may head an iḍāfa chain not yet complete", "idafa_head"
@@ -299,6 +338,7 @@ def check_structural_guards(text: str) -> GuardResult:
 
 __all__ = [
     "GuardResult",
+    "camel_morphology_available",
     "check_structural_guards",
     "chunk_for_translation",
     "join_translations",

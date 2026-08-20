@@ -18,8 +18,9 @@ RUN apt-get update \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-guards.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-guards.txt \
+    && python -m camel_tools.cli.camel_data -i morphology-db-msa-r13
 
 COPY src/ src/
 COPY scripts/ scripts/

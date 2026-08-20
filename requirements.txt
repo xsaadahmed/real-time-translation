@@ -1,4 +1,4 @@
-# Core pipeline dependencies. Everything here runs fully locally on CPU.
+# Core pipeline dependencies for Python 3.12.x only (.python-version / Docker / CI).
 # Models are downloaded once from Hugging Face, then cached; see README for
 # how to run with HF_HUB_OFFLINE=1 afterwards.
 
@@ -19,11 +19,11 @@ sacremoses>=0.1
 # TTS: Windows SAPI5 backend. Zero download, no espeak-ng needed.
 pyttsx3>=2.90
 
-# Arabic morphology for the structural guards in text.py (VSO, iḍāfa, TAM,
-# proclitics). Dictionary-based Analyzer only - the neural disambiguator is
-# too slow for the 240ms live hot loop. Run `python scripts/download_models.py`
-# (or `camel_data -i morphology-db-msa-r13`) to fetch the ~40MB dictionary.
-camel-tools>=1.5
+# Arabic morphology (VSO / iḍāfa guards) is OPTIONAL — not listed here so a
+# plain `pip install -r requirements.txt` works on Python 3.12 without camel.
+# See requirements-guards.txt and:
+#   pip install -r requirements-guards.txt
+#   python scripts/download_models.py --camel-data-only
 
 # UI
 gradio>=4.44

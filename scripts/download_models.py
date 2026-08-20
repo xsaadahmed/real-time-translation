@@ -1,9 +1,17 @@
 """Pre-download every model so the pipeline can afterwards run fully offline.
 
+Requires Python 3.12.x (see ``.python-version`` / Docker / CI).
+
     python scripts/download_models.py
     python scripts/download_models.py --asr-model medium --mt-backend nllb
+    python scripts/download_models.py --camel-data-only
 
 Once this completes, set HF_HUB_OFFLINE=1 to guarantee no network access.
+
+Optional morphology (VSO / iḍāfa guards):
+
+    pip install -r requirements-guards.txt
+    python scripts/download_models.py --camel-data-only
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rtt.config import PipelineConfig  # noqa: E402
+from rtt.python_compat import require_supported_python  # noqa: E402
 
 
 def download_asr(config: PipelineConfig) -> None:
@@ -47,21 +56,26 @@ def download_tts(config: PipelineConfig) -> None:
     print(f"[tts] using '{engine.name}'")
 
 
-def download_camel_data() -> None:
-    """Fetch the dictionary-based MSA morphology database used by the Arabic
-    structural guards (text.py). Deliberately NOT the neural disambiguator
-    (disambig-*) or dialect/BERT models — those are too slow for the 240ms
-    live hot loop; a plain dictionary lookup is enough for POS candidates.
-    """
+def download_camel_data() -> bool:
+    """Fetch the dictionary MSA morphology DB. Return False if camel-tools missing."""
     import subprocess
 
-    from camel_tools.morphology.database import MorphologyDB
+    try:
+        from camel_tools.morphology.database import MorphologyDB
+    except ImportError:
+        print(
+            "[camel-tools] package not installed.\n"
+            "  pip install -r requirements-guards.txt\n"
+            "  python scripts/download_models.py --camel-data-only",
+            file=sys.stderr,
+        )
+        return False
 
     print("[camel-tools] checking for 'calima-msa-r13' morphology database ...")
     try:
         MorphologyDB.builtin_db(db_name="calima-msa-r13", flags="a")
         print("[camel-tools] already installed")
-        return
+        return True
     except FileNotFoundError:
         pass
 
@@ -69,16 +83,34 @@ def download_camel_data() -> None:
         [sys.executable, "-m", "camel_tools.cli.camel_data", "-i", "morphology-db-msa-r13"],
         check=True,
     )
-    print("[camel-tools] done")
+    print("[camel-tools] done (~40MB dictionary DB)")
+    return True
 
 
 def main() -> int:
+    require_supported_python()
+
     parser = argparse.ArgumentParser(description="Pre-download models for offline use")
     parser.add_argument("--asr-model", default=None)
     parser.add_argument("--mt-backend", default=None, choices=["marian", "nllb"])
     parser.add_argument("--skip-tts", action="store_true")
-    parser.add_argument("--skip-camel-data", action="store_true")
+    parser.add_argument(
+        "--skip-camel-data",
+        action="store_true",
+        help="Skip optional morphology DB (VSO/iḍāfa guards stay disabled)",
+    )
+    parser.add_argument(
+        "--camel-data-only",
+        action="store_true",
+        help="Only fetch the camel-tools morphology DB (after requirements-guards.txt)",
+    )
     args = parser.parse_args()
+
+    if args.camel_data_only:
+        if not download_camel_data():
+            return 1
+        print("\nMorphology DB ready. Lexicon guards already work without it.")
+        return 0
 
     config = PipelineConfig()
     if args.asr_model:
@@ -91,8 +123,20 @@ def main() -> int:
     download_mt(config)
     if not args.skip_tts:
         download_tts(config)
-    if not args.skip_camel_data:
-        download_camel_data()
+
+    if args.skip_camel_data:
+        print(
+            "[camel-tools] skipped. Lexicon guards still work; for VSO/iḍāfa:\n"
+            "  pip install -r requirements-guards.txt\n"
+            "  python scripts/download_models.py --camel-data-only"
+        )
+    elif not download_camel_data():
+        print(
+            "[camel-tools] optional step skipped (package not installed).\n"
+            "  Core pipeline is fine. For VSO/iḍāfa guards later:\n"
+            "  pip install -r requirements-guards.txt\n"
+            "  python scripts/download_models.py --camel-data-only"
+        )
 
     print("\nAll models cached. You can now run with HF_HUB_OFFLINE=1.")
     return 0

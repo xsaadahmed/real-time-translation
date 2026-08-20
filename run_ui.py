@@ -14,6 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from rtt.python_compat import require_supported_python  # noqa: E402
+
+require_supported_python()
+
 from rtt.config import PipelineConfig  # noqa: E402
 from rtt.ui.gradio_app import launch  # noqa: E402
 

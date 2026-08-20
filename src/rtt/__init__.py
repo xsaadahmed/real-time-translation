@@ -1,15 +1,24 @@
 """Local Arabic -> English speech translation.
 
-Stage 1: a straightforward offline cascade of speech recognition, machine
-translation and speech synthesis, running entirely on the local machine with
-no external API calls. Streaming, anticipation and the commitment policy are
-planned as later additions; the component interfaces here are built to accept
-them without restructuring.
+Heavy pipeline imports are lazy so lightweight modules (e.g. ``python_compat``,
+``text``) can load on a wrong interpreter long enough to print a clear
+Python 3.12 requirement instead of a cryptic numpy wheel error.
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "PipelineConfig",
+    "PipelineResult",
+    "TranslationPipeline",
+    "__version__",
+    "build_pipeline",
+]
 
 
 def _configure_environment() -> None:
@@ -26,15 +35,18 @@ def _configure_environment() -> None:
 
 _configure_environment()
 
-from .config import PipelineConfig  # noqa: E402
-from .pipeline import PipelineResult, TranslationPipeline, build_pipeline  # noqa: E402
 
-__version__ = "0.1.0"
+def __getattr__(name: str) -> Any:
+    if name == "PipelineConfig":
+        from .config import PipelineConfig
 
-__all__ = [
-    "PipelineConfig",
-    "PipelineResult",
-    "TranslationPipeline",
-    "__version__",
-    "build_pipeline",
-]
+        return PipelineConfig
+    if name in {"PipelineResult", "TranslationPipeline", "build_pipeline"}:
+        from .pipeline import PipelineResult, TranslationPipeline, build_pipeline
+
+        return {
+            "PipelineResult": PipelineResult,
+            "TranslationPipeline": TranslationPipeline,
+            "build_pipeline": build_pipeline,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

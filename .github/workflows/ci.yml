@@ -22,10 +22,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-guards.txt
 
       - name: Fetch camel-tools morphology database
-        run: python -m camel_tools.cli.camel_data -i morphology-db-msa-r13
+        run: python scripts/download_models.py --camel-data-only
 
       - name: Run pytest
         run: pytest tests/

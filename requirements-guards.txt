@@ -1,0 +1,12 @@
+# Optional Arabic structural guards that need morphology (VSO, iḍāfa).
+# Lexicon-only guards (TAM particles, compound numerals, dangling proclitics)
+# work without this file.
+#
+# Install (Python 3.12 venv):
+#   pip install -r requirements-guards.txt
+#   python scripts/download_models.py --camel-data-only
+#
+# That second command fetches the ~40MB dictionary-only database
+# 'morphology-db-msa-r13' (calima-msa-r13). The neural disambiguator is
+# intentionally not downloaded — too slow for the live path.
+camel-tools>=1.5

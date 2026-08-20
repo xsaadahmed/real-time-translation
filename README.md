@@ -206,7 +206,7 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Production UI wired to verified/provisional | ✅ black = verified, grey = provisional, live WebSocket |
 | Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
 | Branched translator + agreement scoring | ✅ batched branches + agreement depth (live path partial) |
-| Arabic structural guards | ✅ `check_structural_guards()` in `text.py` (not yet wired into live commit path) |
+| Arabic structural guards | ✅ lexicon always; VSO/iḍāfa via optional `requirements-guards.txt` |
 | Seamless second opinion | ✅ opt-in logging channel (`RTT_SECOND_OPINION_ENABLED=1`) |
 | Retrospective label harvesting | ✅ offline `scripts/harvest_labels.py` |
 | Speculative TTS + jitter buffer | 🔲 |
@@ -220,23 +220,53 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 
 The interpreter is the **Next.js production UI** plus the WebSocket API. Gradio is not the product.
 
-Python **3.12** is the supported version (matches Docker and CI). Node.js is required for local UI.
+### Python version (required)
+
+Use **Python 3.12.x only** (same as Docker and CI). `.python-version` pins `3.12`.
+
+Python 3.13+ / 3.14 will fail on native wheels such as numpy — `run_production.py` and `scripts/download_models.py` exit early with an install hint if the interpreter is wrong.
 
 ```powershell
-python -m venv .venv
+# Windows (install 3.12 from python.org or winget if needed)
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python --version   # must print 3.12.x
+```
+
+```bash
+# macOS / Linux
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+### Core install
+
+Node.js is required for the local UI.
+
+```powershell
 pip install -r requirements.txt
 python scripts/download_models.py
-
-# Interpreter — http://127.0.0.1:3000 (requires Node.js)
 python run_production.py
 ```
 
-`run_production.py` starts the API and UI, auto-picks free ports, and writes the WebSocket URL for the browser.
+Open http://127.0.0.1:3000.
 
 ```powershell
 pytest tests/
 ```
+
+### Optional: Arabic morphology guards (camel-tools)
+
+Lexicon guards (TAM, numerals, proclitics) work with the core install.
+
+**VSO** and **iḍāfa** guards need an extra package and a ~40MB dictionary DB. Without them the live path still runs; those two guards simply no-op.
+
+```powershell
+pip install -r requirements-guards.txt
+python scripts/download_models.py --camel-data-only
+```
+
+Docker and CI install this step automatically.
 
 ---
 
@@ -320,7 +350,10 @@ src/rtt/
   asr/  mt/  tts/         Pluggable backends
   text.py                 Arabic chunking; guard rules land here
 scripts/                  Model download, smoke tests
+requirements.txt          Core deps (Python 3.12)
+requirements-guards.txt   Optional camel-tools for VSO/iḍāfa guards
 .env.example              Production / Docker environment template
+.python-version           Pins CPython 3.12 for pyenv / asdf
 ```
 
 ---

@@ -27,6 +27,12 @@ HOST = "127.0.0.1"
 MAX_PORT_ATTEMPTS = 50
 API_STARTUP_TIMEOUT_SEC = 8.0
 
+# Gate before any rtt / numpy imports so Python 3.14 fails with a clear hint.
+sys.path.insert(0, str(SRC))
+from rtt.python_compat import require_supported_python  # noqa: E402
+
+require_supported_python()
+
 
 def _resolve_pm() -> tuple[str, list[str]]:
     """Return an executable path and base args for npm/pnpm (Windows-safe)."""
