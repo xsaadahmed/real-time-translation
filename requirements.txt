@@ -29,3 +29,9 @@ camel-tools>=1.5
 gradio>=4.44
 fastapi>=0.115
 uvicorn[standard]>=0.30
+
+# Second opinion (opt-in, off by default - RTT_SECOND_OPINION_ENABLED=1):
+# independent Seamless ar->en channel via transformers (already listed
+# above). No extra package needed, but the smallest usable checkpoint
+# ('facebook/hf-seamless-m4t-medium') is ~4.8GB and not fetched by
+# download_models.py automatically - see src/rtt/second_opinion/seamless.py.

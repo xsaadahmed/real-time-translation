@@ -119,10 +119,35 @@ class TTSConfig:
 
 
 @dataclass
+class SecondOpinionConfig:
+    """Independent Seamless ar->en channel, run alongside the cascade purely
+    to log agreement/disagreement (README "Seamless second-opinion channel").
+    Off by default: the smallest usable checkpoint is a multi-GB, 1.2B-param
+    model, nowhere near real-time on CPU-only hardware.
+    """
+
+    enabled: bool = field(default_factory=lambda: _env_bool("SECOND_OPINION_ENABLED", False))
+    model_name: str = field(default_factory=lambda: _env("SECOND_OPINION_MODEL", ""))
+    device: str = field(default_factory=lambda: _env("SECOND_OPINION_DEVICE", "auto"))
+    cache_dir: str = field(
+        default_factory=lambda: _env("SECOND_OPINION_CACHE_DIR", str(MODEL_DIR / "second_opinion"))
+    )
+    log_path: str = field(
+        default_factory=lambda: _env(
+            "SECOND_OPINION_LOG", str(OUTPUT_DIR / "second_opinion_log.jsonl")
+        )
+    )
+
+    def resolved_device(self) -> str:
+        return detect_device() if self.device == "auto" else self.device
+
+
+@dataclass
 class PipelineConfig:
     asr: ASRConfig = field(default_factory=ASRConfig)
     mt: MTConfig = field(default_factory=MTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
+    second_opinion: SecondOpinionConfig = field(default_factory=SecondOpinionConfig)
     output_dir: str = field(default_factory=lambda: _env("OUTPUT_DIR", str(OUTPUT_DIR)))
 
     @classmethod
@@ -139,6 +164,7 @@ class PipelineConfig:
             "mt.backend": self.mt.backend,
             "mt.device": self.mt.resolved_device(),
             "tts.backend": self.tts.backend,
+            "second_opinion.enabled": str(self.second_opinion.enabled),
         }
 
 
@@ -150,6 +176,7 @@ __all__ = [
     "OUTPUT_DIR",
     "PROJECT_ROOT",
     "PipelineConfig",
+    "SecondOpinionConfig",
     "TTSConfig",
     "detect_device",
 ]
