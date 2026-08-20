@@ -24,8 +24,45 @@ ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 UI = ROOT / "production-ui"
 HOST = "127.0.0.1"
-MAX_PORT_ATTEMPTS = 50
-API_STARTUP_TIMEOUT_SEC = 8.0
+MAX_PORT_ATTEMPTS = 20
+# /health is available as soon as uvicorn binds (warmup is background).
+API_BIND_TIMEOUT_SEC = 30.0
+API_READY_TIMEOUT_SEC = 600.0
+API_READY_POLL_SEC = 2.0
+
+
+def _port_accepting(port: int, host: str = HOST) -> bool:
+    """True when something accepts TCP connections on the port (bound)."""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _api_alive(port: int) -> bool:
+    """True when the API process is up (/health) or at least bound on the port."""
+    if _port_accepting(port):
+        try:
+            with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=1.0) as resp:
+                return resp.status == 200
+        except Exception:
+            # Bound but HTTP not ready yet — still count as alive for bind phase.
+            return True
+    return False
+
+
+def _api_ready(port: int) -> bool:
+    """True when /ready succeeds (models loaded)."""
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/ready", timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _api_healthy(port: int) -> bool:
+    return _api_ready(port) or _api_alive(port)
 
 # Gate before any rtt / numpy imports so Python 3.14 fails with a clear hint.
 sys.path.insert(0, str(SRC))
@@ -118,13 +155,15 @@ def _kill_process_on_port(port: int) -> None:
                 pass
 
 
-def _cleanup_stale_api(start_port: int, span: int = 10) -> None:
-    """Stop leftover uvicorn instances from prior crashed runs."""
+def _cleanup_stale_api(start_port: int, span: int = 60) -> None:
+    """Stop leftover uvicorn instances from prior crashed / timed-out runs."""
     for port in range(start_port, start_port + span):
-        if _is_port_in_use(port) and _api_healthy(port):
-            print(f"Releasing API port {port} (previous instance)…")
-            _kill_process_on_port(port)
-            time.sleep(0.4)
+        if not _is_port_in_use(port):
+            continue
+        # Kill anything left listening — prior false timeouts leave many orphans.
+        print(f"Releasing API port {port} (previous instance)…")
+        _kill_process_on_port(port)
+        time.sleep(0.3)
 
 
 def _cleanup_stale_next_dev() -> None:
@@ -146,19 +185,6 @@ def _cleanup_stale_next_dev() -> None:
         lock_path.unlink()
     except OSError:
         pass
-
-
-def _api_healthy(port: int) -> bool:
-    try:
-        with urllib.request.urlopen(f"http://{HOST}:{port}/ready", timeout=1.5) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, TimeoutError, OSError):
-        # Fall back to liveness while models are still loading
-        try:
-            with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=1.5) as resp:
-                return resp.status == 200
-        except (urllib.error.URLError, TimeoutError, OSError):
-            return False
 
 
 def _ui_healthy(port: int) -> bool:
@@ -219,26 +245,77 @@ def _start_api(env: dict[str, str], start_port: int) -> tuple[subprocess.Popen, 
             "--port",
             str(port),
         ]
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+        # Parent may already have warmed models; child still needs its own
+        # in-process load. Give it a long ready window instead of port-hopping.
+        child_env = env.copy()
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=child_env)
 
-        deadline = time.monotonic() + API_STARTUP_TIMEOUT_SEC
-        while time.monotonic() < deadline:
+        # Phase 1: process must accept connections (bind succeeded).
+        bind_deadline = time.monotonic() + API_BIND_TIMEOUT_SEC
+        bound = False
+        while time.monotonic() < bind_deadline:
             if proc.poll() is not None:
                 break
-            if _api_healthy(port):
-                if port != start_port:
-                    print(f"API started on port {port} (requested {start_port} was busy).")
-                return proc, port
+            if _api_alive(port):
+                bound = True
+                break
             time.sleep(0.25)
 
+        if proc.poll() is not None:
+            print(f"API exited before binding on port {port}, trying next…")
+            continue
+
+        if not bound:
+            print(f"API did not become reachable on port {port}, trying next…")
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            continue
+
+        # Phase 2: wait for models (/ready). Do NOT hop ports while loading.
+        print(
+            f"API listening on {HOST}:{port} — loading models "
+            f"(this can take several minutes on first run)…"
+        )
+        ready_deadline = time.monotonic() + API_READY_TIMEOUT_SEC
+        last_note = 0.0
+        while time.monotonic() < ready_deadline:
+            if proc.poll() is not None:
+                print(f"API process exited while loading models on port {port}.")
+                break
+            if _api_ready(port):
+                if port != start_port:
+                    print(f"API ready on port {port} (requested {start_port} was busy).")
+                else:
+                    print(f"API ready on http://{HOST}:{port}")
+                return proc, port
+            now = time.monotonic()
+            if now - last_note >= 15.0:
+                remaining = int(ready_deadline - now)
+                print(f"  still loading models… ({remaining}s timeout remaining)")
+                last_note = now
+            time.sleep(API_READY_POLL_SEC)
+
         if proc.poll() is None:
+            print(
+                f"Timed out waiting for models on port {port} "
+                f"after {int(API_READY_TIMEOUT_SEC)}s — stopping this worker."
+            )
             proc.terminate()
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-        print(f"Could not bind API on port {port}, trying next…")
+        # Only try another port if this one failed hard; usually one attempt is enough.
+        raise RuntimeError(
+            f"API started on port {port} but models did not become ready within "
+            f"{int(API_READY_TIMEOUT_SEC)}s. Check CPU/disk and retry; "
+            f"or run `python scripts/download_models.py` first."
+        )
 
     raise RuntimeError(
         f"Failed to start API after checking ports {start_port}–"
@@ -294,7 +371,16 @@ def main() -> int:
     parser.add_argument("--api-port", type=int, default=8765)
     parser.add_argument("--ui-port", type=int, default=3000)
     parser.add_argument("--skip-install", action="store_true")
-    parser.add_argument("--skip-warmup", action="store_true")
+    parser.add_argument(
+        "--warmup-parent",
+        action="store_true",
+        help="Also load models in this process before starting the API (usually slower; API loads them anyway)",
+    )
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Deprecated alias: parent warmup is off by default now",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -310,14 +396,18 @@ def main() -> int:
     if not args.skip_install:
         _install_ui_deps(pm)
 
-    if not args.skip_warmup:
+    if args.warmup_parent and not args.skip_warmup:
         _warmup_models()
+    else:
+        print("Models will load inside the API process (first run can take a few minutes).")
 
+    print("Cleaning up any leftover API workers from earlier runs…")
     _cleanup_stale_api(args.api_port)
     _cleanup_stale_next_dev()
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC)
+    env.setdefault("RTT_SKIP_MODEL_WARMUP", "0")
 
     try:
         api_proc, api_port = _start_api(env, args.api_port)

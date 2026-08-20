@@ -42,25 +42,23 @@ async def lifespan(_app: FastAPI):
         in {"1", "true", "yes", "on"},
         level=os.environ.get("RTT_LOG_LEVEL", "INFO"),
     )
-    skip = os.environ.get("RTT_SKIP_MODEL_WARMUP", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    loop = asyncio.get_running_loop()
-    if skip:
-        logger.warning(
-            "RTT_SKIP_MODEL_WARMUP=1 — warming models in background; /ready is 503 until done"
-        )
-        loop.run_in_executor(_executor, warmup_models)
-    else:
-        await loop.run_in_executor(_executor, warmup_models)
+    # Always warm in the background so uvicorn can bind and answer /health
+    # immediately. Blocking warmup here made the launcher think the port
+    # never came up (models take far longer than the bind timeout).
+    from .readiness import mark_not_ready
 
-    logger.info("API startup complete", extra={"event": "api_start"})
+    mark_not_ready("Loading models…")
+    loop = asyncio.get_running_loop()
+    warm_future = loop.run_in_executor(_executor, warmup_models)
+    logger.info(
+        "API listening; model warmup running in background",
+        extra={"event": "api_start"},
+    )
     try:
         yield
     finally:
+        if not warm_future.done():
+            warm_future.cancel()
         logger.info("API shutting down", extra={"event": "api_shutdown"})
         _executor.shutdown(wait=False, cancel_futures=True)
 

@@ -222,36 +222,71 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 
 The interpreter is the **Next.js production UI** plus the WebSocket API. Gradio is not the product.
 
-### Python version (required)
-
-Use **Python 3.12.x only** (same as Docker and CI). `.python-version` pins `3.12`.
-
-Python 3.13+ / 3.14 will fail on native wheels such as numpy — `run_production.py` and `scripts/download_models.py` exit early with an install hint if the interpreter is wrong.
+### Start the bot (every time)
 
 ```powershell
-# Windows (install 3.12 from python.org or winget if needed)
-py -3.12 -m venv .venv
+cd C:\Users\xsaad\Documents\real-time-translation
 .\.venv\Scripts\Activate.ps1
-python --version   # must print 3.12.x
-```
-
-```bash
-# macOS / Linux
-python3.12 -m venv .venv
-source .venv/bin/activate
-```
-
-### Core install
-
-Node.js is required for the local UI.
-
-```powershell
-pip install -r requirements.txt
-python scripts/download_models.py
+python --version          # must show 3.12.x
 python run_production.py
 ```
 
-Open http://127.0.0.1:3000.
+Wait until you see:
+
+```text
+API ready on http://127.0.0.1:8765
+UI:   http://127.0.0.1:3000
+```
+
+Then open **http://127.0.0.1:3000** in your browser.
+
+- First start can take **1–3 minutes** while Whisper + translation models load. You will see `still loading models…` — do not Ctrl+C during that.
+- Later starts are faster once models are cached.
+- Stop both servers with **Ctrl+C**.
+
+macOS / Linux:
+
+```bash
+cd /path/to/real-time-translation
+source .venv/bin/activate
+python run_production.py
+# open http://127.0.0.1:3000
+```
+
+### First-time setup (once)
+
+Use **Python 3.12.x only** (same as Docker and CI). `.python-version` pins `3.12`. Python 3.13+ / 3.14 will fail — the launcher exits early with an install hint.
+
+**Windows:**
+
+```powershell
+# Install 3.12 if needed: winget install Python.Python.3.12
+cd C:\Users\xsaad\Documents\real-time-translation
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python --version   # must print 3.12.x
+pip install -r requirements.txt
+python scripts/download_models.py
+```
+
+**macOS / Linux:**
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python scripts/download_models.py
+```
+
+Node.js is required for the local UI (`npm` must be on PATH).
+
+Then start:
+
+```powershell
+python run_production.py
+```
+
+### Tests
 
 ```powershell
 pytest tests/
