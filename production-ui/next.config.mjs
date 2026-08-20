@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: 'standalone',
   // Allow opening the dev UI via 127.0.0.1 (run_production.py prints that host).
   allowedDevOrigins: ['127.0.0.1', 'localhost'],
   typescript: {

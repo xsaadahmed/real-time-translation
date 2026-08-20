@@ -1,0 +1,15 @@
+# Direct port access without TLS — useful for local debugging.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  api:
+    ports:
+      - "8765:8765"
+
+  ui:
+    ports:
+      - "3000:3000"
+
+  proxy:
+    profiles:
+      - production-only

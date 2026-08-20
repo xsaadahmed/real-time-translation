@@ -1,0 +1,32 @@
+# Public hostname for HTTPS. Use your real domain in production.
+# For local TLS testing: localhost (Caddy uses an internal CA).
+{$RTT_PUBLIC_HOST:localhost} {
+	encode gzip
+
+	# WebSocket + REST API (same origin as the UI → wss://host/ws)
+	handle /ws* {
+		reverse_proxy api:8765
+	}
+
+	handle /health {
+		reverse_proxy api:8765
+	}
+
+	# Next.js production UI
+	handle {
+		reverse_proxy ui:3000
+	}
+}
+
+# Plain HTTP on port 8080 for quick checks without TLS (optional).
+:8080 {
+	handle /ws* {
+		reverse_proxy api:8765
+	}
+	handle /health {
+		reverse_proxy api:8765
+	}
+	handle {
+		reverse_proxy ui:3000
+	}
+}

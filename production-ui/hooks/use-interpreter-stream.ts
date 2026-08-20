@@ -5,6 +5,30 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 const DEFAULT_WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://127.0.0.1:8765/ws'
 const MIC_CHUNK_MS = 500
 
+function sameOriginWsUrl(): string | null {
+  if (typeof window === 'undefined') return null
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/ws`
+}
+
+async function resolveWsUrl(): Promise<string> {
+  try {
+    const res = await fetch('/runtime-config.json', { cache: 'no-store' })
+    if (res.ok) {
+      const data = (await res.json()) as { wsUrl?: string }
+      if (data.wsUrl) return data.wsUrl
+    }
+  } catch {
+    // fall through to build-time / same-origin / default URL
+  }
+
+  if (process.env.NEXT_PUBLIC_WS_URL) {
+    return process.env.NEXT_PUBLIC_WS_URL
+  }
+
+  return sameOriginWsUrl() ?? DEFAULT_WS_URL
+}
+
 export type ServerPayload = {
   type?: string
   arabic?: string
@@ -40,19 +64,6 @@ const EMPTY_STATE: InterpreterState = {
   finalizing: false,
   finalized: false,
   error: null,
-}
-
-async function resolveWsUrl(): Promise<string> {
-  try {
-    const res = await fetch('/runtime-config.json', { cache: 'no-store' })
-    if (res.ok) {
-      const data = (await res.json()) as { wsUrl?: string }
-      if (data.wsUrl) return data.wsUrl
-    }
-  } catch {
-    // fall through to build-time / default URL
-  }
-  return DEFAULT_WS_URL
 }
 
 function applyPayload(state: InterpreterState, msg: ServerPayload): InterpreterState {

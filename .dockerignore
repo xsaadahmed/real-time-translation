@@ -1,0 +1,25 @@
+# Git / local dev
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.idea
+.vscode
+
+# Runtime artifacts
+models
+outputs
+*.wav
+.env
+.env.local
+
+# Node (rebuilt in image)
+production-ui/node_modules
+production-ui/.next
+production-ui/public/runtime-config.json
+
+# Docs / misc
+README.md
+agent-transcripts

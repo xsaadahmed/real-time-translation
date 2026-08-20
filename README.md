@@ -205,11 +205,13 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Verified vs provisional Arabic (live lane) | ✅ `reconcile_provisional()` in `text.py` + session split |
 | Production UI wired to verified/provisional | ✅ black = verified, grey = provisional, live WebSocket |
 | Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
-| Branched translator + risk model | 🔲 |
+| Branched translator + agreement scoring | ✅ batched branches + agreement depth (live path partial) |
 | Arabic structural guards | ✅ `check_structural_guards()` in `text.py` (not yet wired into live commit path) |
-| Seamless second opinion | 🔲 |
+| Seamless second opinion | ✅ opt-in logging channel (`RTT_SECOND_OPINION_ENABLED=1`) |
+| Retrospective label harvesting | ✅ offline `scripts/harvest_labels.py` |
 | Speculative TTS + jitter buffer | 🔲 |
 | Cloned-voice streaming TTS | 🔲 target (CosyVoice2) |
+| Production packaging (Docker + HTTPS) | ✅ Compose + Caddy reverse proxy |
 
 ---
 
@@ -231,6 +233,61 @@ python run_production.py
 
 `run_production.py` auto-picks free ports, clears stale dev servers, and writes the WebSocket URL for the UI.
 
+---
+
+## Production deploy (Docker)
+
+Runs the API, Next.js UI, and a **Caddy** reverse proxy that terminates HTTPS and routes **`wss://your-host/ws`** to the API on the same origin (no split-origin CORS).
+
+### 1. Configure
+
+```bash
+cp .env.example .env
+# Set your real domain for Let's Encrypt:
+# RTT_PUBLIC_HOST=translate.example.com
+```
+
+All pipeline tuning uses existing `RTT_*` variables (see `.env.example`).
+
+### 2. Start (HTTPS via Caddy)
+
+```bash
+docker compose up -d --build
+```
+
+| URL | Purpose |
+| --- | --- |
+| `https://<RTT_PUBLIC_HOST>/` | Production UI |
+| `wss://<RTT_PUBLIC_HOST>/ws` | Live interpreter WebSocket (auto-used by UI) |
+| `https://<RTT_PUBLIC_HOST>/health` | API health check |
+| `http://localhost:8080/` | Plain HTTP (no TLS), for quick local checks |
+
+**First boot** downloads ASR/MT models into the `rtt-models` volume and can take several minutes. Model cache persists across restarts.
+
+For **local HTTPS** with `RTT_PUBLIC_HOST=localhost`, Caddy uses an internal CA — trust it in your browser or use port `8080` instead.
+
+### 3. Dev-style Docker (direct ports, no proxy)
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+- UI: `http://localhost:3000`
+- API / WS: `http://localhost:8765` / `ws://localhost:8765/ws`
+
+Set `RTT_PUBLIC_WS_URL=ws://localhost:8765/ws` in `.env` if the UI cannot reach the API on the same host.
+
+### Environment reference
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RTT_PUBLIC_HOST` | `localhost` | Domain Caddy serves (TLS) |
+| `RTT_PUBLIC_URL` | — | Optional public site URL (health metadata) |
+| `RTT_PUBLIC_WS_URL` | — | Override WebSocket URL written to UI runtime config |
+| `RTT_CORS_ORIGINS` | localhost dev ports | Required only for split-origin deploys |
+| `RTT_SKIP_MODEL_WARMUP` | `0` | Skip model load at API container start |
+| `RTT_API_HOST` / `RTT_API_PORT` | `0.0.0.0` / `8765` | API bind address inside container |
+
 ### Live tuning
 
 ```powershell
@@ -245,16 +302,20 @@ $env:RTT_NLLB_SOURCE_LANG="apc_Arab"
 ## Project layout
 
 ```
-run_production.py         Production Next.js UI + WebSocket API
+run_production.py         Local dev launcher (Next.js dev + API)
 run_ui.py                 Gradio dev UI
+docker-compose.yml        Production stack (api + ui + Caddy HTTPS)
+docker/                   Dockerfiles, Caddyfile, entrypoints
 production-ui/            Interpreter interface (grey/black text UX)
 src/rtt/
   pipeline.py             Current cascade orchestrator
   live/session.py         Incremental live sessions (step toward draft lane)
   api/production_server.py WebSocket bridge
+  api/settings.py         Production API env (CORS, public URLs)
   asr/  mt/  tts/         Pluggable backends
   text.py                 Arabic chunking; guard rules land here
 scripts/                  Model download, smoke tests
+.env.example              Production / Docker environment template
 ```
 
 ---

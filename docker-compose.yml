@@ -1,0 +1,69 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RTT_ASR_DOWNLOAD_ROOT: /app/models/whisper
+      RTT_MT_CACHE_DIR: /app/models/mt
+      RTT_TTS_CACHE_DIR: /app/models/tts
+      RTT_SECOND_OPINION_CACHE_DIR: /app/models/second_opinion
+      RTT_OUTPUT_DIR: /app/outputs
+      HF_HOME: /app/models/huggingface
+      TRANSFORMERS_CACHE: /app/models/huggingface
+    volumes:
+      - rtt-models:/app/models
+      - rtt-outputs:/app/outputs
+    expose:
+      - "8765"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 600s
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+      args:
+        NEXT_PUBLIC_WS_URL: ${RTT_PUBLIC_WS_URL:-}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RTT_PUBLIC_WS_URL: ${RTT_PUBLIC_WS_URL:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - "443:443"
+      - "80:80"
+      - "8080:8080"
+    environment:
+      RTT_PUBLIC_HOST: ${RTT_PUBLIC_HOST:-localhost}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+      - ui
+    restart: unless-stopped
+
+volumes:
+  rtt-models:
+  rtt-outputs:
+  caddy-data:
+  caddy-config:

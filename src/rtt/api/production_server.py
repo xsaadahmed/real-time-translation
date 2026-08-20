@@ -14,6 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..ui.gradio_app import get_store
+from .settings import CORS_ORIGINS, PUBLIC_URL, PUBLIC_WS_URL
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,7 @@ app = FastAPI(title="RTT Production API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3001",
-        "http://localhost:3001",
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +87,12 @@ async def _poll_updates(
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    payload: dict[str, str] = {"status": "ok"}
+    if PUBLIC_URL:
+        payload["public_url"] = PUBLIC_URL
+    if PUBLIC_WS_URL:
+        payload["ws_url"] = PUBLIC_WS_URL
+    return payload
 
 
 @app.websocket("/ws")
