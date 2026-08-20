@@ -17,8 +17,9 @@ from typing import Callable
 import numpy as np
 
 from ..audio import resample, save_wav, to_mono_float32
-from ..config import ASR_SAMPLE_RATE
+from ..config import ASR_SAMPLE_RATE, SecondOpinionConfig
 from ..pipeline import TranslationPipeline
+from ..second_opinion import SecondOpinionEngine, compare, log_record
 from ..text import merge_incremental_text, reconcile_provisional
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class LiveSessionStore:
         self,
         live_pipeline: TranslationPipeline,
         final_pipeline_getter: Callable[[], TranslationPipeline],
+        second_opinion_config: SecondOpinionConfig | None = None,
     ) -> None:
         self.live_pipeline = live_pipeline
         self._get_final_pipeline = final_pipeline_getter
@@ -98,6 +100,11 @@ class LiveSessionStore:
         self._lock = threading.Lock()
         self._process_lock = threading.Lock()
         self._processors_running: set[str] = set()
+        # Off by default - self-contained and independent of the cascade,
+        # so it never blocks the main path (see second_opinion/README notes).
+        self._second_opinion_config = second_opinion_config or SecondOpinionConfig()
+        self._second_opinion_engine: SecondOpinionEngine | None = None
+        self._second_opinion_lock = threading.Lock()
 
     def create(self) -> LiveStreamState:
         state = LiveStreamState(
@@ -275,7 +282,51 @@ class LiveSessionStore:
         else:
             state.status_message = f"No speech detected in {duration:.1f}s"
 
+        if self._second_opinion_config.enabled and arabic_text:
+            self._run_second_opinion_async(state)
+
         return state
+
+    def _run_second_opinion_async(self, state: LiveStreamState) -> threading.Thread:
+        """Fire-and-forget: compare the cascade's final English against the
+        independent Seamless channel, and log the comparison. Runs in a
+        background thread so a slow/failing second opinion never blocks or
+        breaks the main transcription path (README step 6: self-contained).
+        """
+        audio = state.audio
+        sample_rate = state.sample_rate
+        cascade_english = state.english_text
+        session_id = state.session_id
+        log_path = self._second_opinion_config.log_path
+
+        def _worker() -> None:
+            try:
+                if self._second_opinion_engine is None:
+                    with self._second_opinion_lock:
+                        if self._second_opinion_engine is None:
+                            from ..second_opinion import build_second_opinion
+
+                            self._second_opinion_engine = build_second_opinion(
+                                self._second_opinion_config
+                            )
+                engine = self._second_opinion_engine
+                assert engine is not None
+                second_opinion_text = engine.translate_speech(audio, sample_rate)
+                record = compare(cascade_english, second_opinion_text, session_id=session_id)
+                log_record(record, log_path)
+                logger.info(
+                    "Second opinion for %s: similarity=%.2f",
+                    session_id[:8],
+                    record.similarity,
+                )
+            except Exception:
+                logger.exception("Second-opinion channel failed for %s", session_id[:8])
+
+        thread = threading.Thread(
+            target=_worker, name=f"second-opinion-{session_id[:8]}", daemon=True
+        )
+        thread.start()
+        return thread
 
     def finalize(self, session_id: str) -> LiveStreamState | None:
         state = self.get(session_id)

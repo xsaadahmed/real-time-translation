@@ -104,7 +104,9 @@ def get_store() -> LiveSessionStore:
                 live_cfg.mt.backend,
             )
             _live_pipeline = build_pipeline(live_cfg, include_tts=False)
-            _store = LiveSessionStore(_live_pipeline, _get_final_pipeline)
+            _store = LiveSessionStore(
+                _live_pipeline, _get_final_pipeline, _config.second_opinion
+            )
             logger.info("Warming up live pipeline…")
             _live_pipeline.warmup()
     return _store
