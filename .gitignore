@@ -6,8 +6,9 @@ __pycache__/
 
 models/
 outputs/
+downloads/
 *.wav
-!samples/*.wav
+!samples/**/*.wav
 
 .env
 .idea/

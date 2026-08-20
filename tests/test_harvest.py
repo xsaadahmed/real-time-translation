@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from rtt.asr.base import ASREngine, Transcript
 from rtt.harvest.harvester import harvest_utterance
-from rtt.harvest.record import label_survival, log_records
+from rtt.harvest.record import exact_prefix_match, label_survival, log_records, survival_score
 from rtt.mt.base import Translator
 
 SAMPLE_RATE = 16_000
@@ -78,12 +78,25 @@ SCHEDULE = [
 ]
 
 
-def test_label_survival_exact_and_partial_prefix():
+def test_exact_prefix_match_is_strict():
     final = "went the-boy to school"
+    assert exact_prefix_match("went the-boy", final) is True
+    assert exact_prefix_match("went the-boy to school", final) is True
+    assert exact_prefix_match("went the-girl", final) is False
+    assert exact_prefix_match("went the-boy to school today", final) is False
+
+
+def test_label_survival_is_fuzzy_and_tolerates_minor_drift():
+    final = "went the-boy to school"
+    # A genuine exact prefix still survives under the fuzzy metric.
     assert label_survival("went the-boy", final) is True
-    assert label_survival("went the-boy to school", final) is True
-    assert label_survival("went the-girl", final) is False
-    assert label_survival("went the-boy to school today", final) is False
+    # Completely unrelated wording does not.
+    assert label_survival("flew away quickly", final) is False
+    assert survival_score("flew away quickly", final) < survival_score("went the-boy", final)
+
+
+def test_survival_score_is_zero_for_empty_candidate():
+    assert survival_score("", "went the-boy to school") == 0.0
 
 
 def test_harvest_utterance_produces_labeled_records():

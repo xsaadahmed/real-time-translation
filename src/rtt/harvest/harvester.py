@@ -23,7 +23,7 @@ from ..mt.base import Translator
 from ..second_opinion.agreement import compare as second_opinion_compare
 from ..second_opinion.base import SecondOpinionEngine
 from ..text import check_structural_guards, merge_incremental_text, reconcile_provisional
-from .record import CommitCandidateRecord, label_survival
+from .record import CommitCandidateRecord, exact_prefix_match, label_survival, survival_score
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,9 @@ def harvest_utterance(
 
     for candidate in records:
         candidate.final_english = final_english
+        candidate.survival_score = survival_score(candidate.english_candidate, final_english)
         candidate.survived = label_survival(candidate.english_candidate, final_english)
+        candidate.exact_prefix_match = exact_prefix_match(candidate.english_candidate, final_english)
         candidate.second_opinion_similarity = second_opinion_similarity
 
     return records
