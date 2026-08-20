@@ -2,23 +2,30 @@
 
 import { motion } from 'motion/react'
 
-/**
- * A tiny click-to-toggle mic control that lives in the type, not as a big
- * floating SaaS button. A soft pulsing dot signals the listening state.
- */
-export function RecordingIndicator({
-  active,
-  onToggle,
-}: {
-  active: boolean
+type Props = {
+  mode: 'idle' | 'connecting' | 'listening' | 'finalizing'
+  disabled?: boolean
   onToggle: () => void
-}) {
+}
+
+const LABELS: Record<Props['mode'], string> = {
+  idle: 'Start',
+  connecting: 'Connecting',
+  listening: 'Stop',
+  finalizing: 'Processing',
+}
+
+export function RecordingIndicator({ mode, disabled, onToggle }: Props) {
+  const active = mode === 'listening'
+  const label = LABELS[mode]
+
   return (
     <button
       type="button"
       onClick={onToggle}
+      disabled={disabled}
       aria-pressed={active}
-      className="group flex items-center gap-2 text-sm text-hint transition-colors hover:text-ink focus-visible:outline-none focus-visible:text-ink"
+      className="group flex items-center gap-2 text-sm text-hint transition-colors hover:text-ink focus-visible:outline-none focus-visible:text-ink disabled:opacity-50 disabled:pointer-events-none"
     >
       <span className="relative flex h-2 w-2 items-center justify-center">
         {active && (
@@ -37,7 +44,7 @@ export function RecordingIndicator({
           }
         />
       </span>
-      <span className="tabular-nums">{active ? 'Listening' : 'Start'}</span>
+      <span className="tabular-nums">{label}</span>
     </button>
   )
 }

@@ -1,27 +1,29 @@
 'use client'
 
-import { AnimatePresence, motion } from 'motion/react'
+type Props = {
+  verified: string
+  provisional: string
+}
 
-export function SourceText({ text }: { text: string }) {
+export function SourceText({ verified, provisional }: Props) {
+  const hasContent = verified || provisional
+
   return (
     <div
       dir="rtl"
       lang="ar"
       aria-label="Arabic source speech"
-      className="font-arabic min-h-[1.6em] text-center text-lg text-hint md:text-xl"
+      className="font-arabic min-h-[1.6em] text-center text-lg leading-relaxed md:text-xl"
     >
-      <AnimatePresence mode="wait">
-        <motion.span
-          key={text}
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.25, ease: 'easeOut' }}
-          className="inline-block leading-relaxed"
-        >
-          {text || '\u00A0'}
-        </motion.span>
-      </AnimatePresence>
+      {hasContent ? (
+        <p>
+          {verified && <span className="text-hint">{verified}</span>}
+          {verified && provisional ? ' ' : ''}
+          {provisional && <span className="text-prediction">{provisional}</span>}
+        </p>
+      ) : (
+        <p className="text-hint opacity-40">&nbsp;</p>
+      )}
     </div>
   )
 }

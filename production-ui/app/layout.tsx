@@ -17,7 +17,7 @@ const notoArabic = Noto_Sans_Arabic({
 export const metadata: Metadata = {
   title: 'Live Interpreter — Arabic to English',
   description:
-    'A minimal real-time speech interpreter. Black is confirmed, grey is what the model predicts comes next.',
+    'Real-time Arabic to English speech interpreter. Black text is verified; grey is provisional.',
   icons: {
     icon: '/icon.svg',
   },

@@ -203,10 +203,10 @@ Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is s
 | Live incremental mic path | ✅ fast live + accurate final on stop |
 | Production UI (speculative text UX) | ✅ Next.js; candidates cosmetic until commitment engine |
 | Verified vs provisional Arabic (live lane) | ✅ `reconcile_provisional()` in `text.py` + session split |
-| Production UI wired to verified/provisional | 🔲 WS fields exist; UI still animates from combined `english` |
+| Production UI wired to verified/provisional | ✅ black = verified, grey = provisional, live WebSocket |
 | Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
 | Branched translator + risk model | 🔲 |
-| Arabic structural guards | 🔲 partial (`text.py` scaffolding) |
+| Arabic structural guards | ✅ `check_structural_guards()` in `text.py` (not yet wired into live commit path) |
 | Seamless second opinion | 🔲 |
 | Speculative TTS + jitter buffer | 🔲 |
 | Cloned-voice streaming TTS | 🔲 target (CosyVoice2) |

@@ -60,8 +60,10 @@ async def _poll_updates(
     stop_event: asyncio.Event,
 ) -> None:
     store = get_store()
-    last_arabic = ""
-    last_english = ""
+    last_ar_verified = ""
+    last_ar_provisional = ""
+    last_en_verified = ""
+    last_en_provisional = ""
     last_status = ""
 
     while not stop_event.is_set():
@@ -69,13 +71,18 @@ async def _poll_updates(
         if state is None or not state.is_active:
             break
 
-        if (
-            state.arabic_text != last_arabic
-            or state.english_text != last_english
+        changed = (
+            state.arabic_verified != last_ar_verified
+            or state.arabic_provisional != last_ar_provisional
+            or state.english_verified != last_en_verified
+            or state.english_provisional != last_en_provisional
             or state.status_message != last_status
-        ):
-            last_arabic = state.arabic_text
-            last_english = state.english_text
+        )
+        if changed:
+            last_ar_verified = state.arabic_verified
+            last_ar_provisional = state.arabic_provisional
+            last_en_verified = state.english_verified
+            last_en_provisional = state.english_provisional
             last_status = state.status_message
             await _send_state(websocket, state)
 
@@ -133,6 +140,10 @@ async def interpreter_socket(websocket: WebSocket) -> None:
                             "type": "final",
                             "arabic": "",
                             "english": "",
+                            "arabic_verified": "",
+                            "arabic_provisional": "",
+                            "english_verified": "",
+                            "english_provisional": "",
                             "status": "No audio captured.",
                             "duration_sec": 0.0,
                             "finalized": True,

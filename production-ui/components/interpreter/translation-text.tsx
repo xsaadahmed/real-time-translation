@@ -1,55 +1,55 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
-import type { Pending, Phase } from '@/hooks/use-interpreter-stream'
-import { ActiveWord } from './active-word'
 
 type Props = {
-  history: string[]
-  committed: string
-  pending: Pending | null
-  phase: Phase
-  running: boolean
-  done: boolean
+  verified: string
+  provisional: string
+  showCaret: boolean
+}
+
+function Caret() {
+  return (
+    <span
+      aria-hidden
+      className="inline-block h-[0.95em] w-[3px] translate-y-[0.14em] animate-caret rounded-[1px] bg-ink align-baseline ml-[2px]"
+    />
+  )
 }
 
 /**
- * A running transcript. Completed sentences stack as history; the active line
- * flows left-to-right, committing one word at a time. The word currently being
- * predicted trails inline at the end with two floating alternates, and a
- * blinking caret marks the write head.
+ * English translation: black = verified (committed), grey = provisional preview.
  */
-export function TranslationText({ history, committed, pending, phase, running }: Props) {
+export function TranslationText({ verified, provisional, showCaret }: Props) {
   const endRef = useRef<HTMLDivElement>(null)
-  const wordKey = `${history.length}-${committed.length}`
+  const hasContent = verified || provisional || showCaret
 
-  // keep the newest line in view as the transcript grows
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-  }, [history.length, committed])
+  }, [verified, provisional])
 
   const textClass =
-    'text-balance text-left text-[1.9rem] font-semibold leading-[1.35] tracking-[-0.01em] text-ink md:text-[2.4rem] lg:text-[2.75rem]'
+    'text-balance text-left text-[1.9rem] font-semibold leading-[1.35] tracking-[-0.01em] md:text-[2.4rem] lg:text-[2.75rem]'
 
-  const showActive = running || committed || pending
+  if (!hasContent) {
+    return (
+      <div className="flex w-full max-w-4xl flex-col">
+        <p className={`${textClass} text-prediction opacity-40`}>
+          English translation appears here.
+        </p>
+        <div ref={endRef} />
+      </div>
+    )
+  }
 
   return (
-    <div aria-live="polite" className="flex w-full max-w-4xl flex-col gap-y-[1.6em]">
-      {history.map((line, i) => (
-        <p key={i} className={textClass}>
-          {line}
-        </p>
-      ))}
-
-      {showActive && (
-        // generous top/bottom room so the floating alternates always clear neighbors
-        <p className={`${textClass} my-[1.5em]`}>
-          {committed}
-          {committed && (pending || running) ? ' ' : ''}
-          <ActiveWord pending={pending} phase={phase} wordKey={wordKey} />
-        </p>
-      )}
-
+    <div aria-live="polite" className="flex w-full max-w-4xl flex-col">
+      <p className={`${textClass} my-[0.5em]`}>
+        {verified && <span className="text-ink">{verified}</span>}
+        {verified && provisional ? ' ' : ''}
+        {provisional && <span className="text-prediction">{provisional}</span>}
+        {showCaret && <Caret />}
+      </p>
       <div ref={endRef} />
     </div>
   )
