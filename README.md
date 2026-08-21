@@ -244,6 +244,8 @@ Then open **http://127.0.0.1:3000** in your browser.
 - Later starts are faster once models are cached.
 - Stop both servers with **Ctrl+C**.
 
+**Boss / target-UX demo (no models):** `python run_demo.py` — same Next.js UI, hardcoded script that shows grey speculative text then black commits growing in real time. Instant ready; not the live cascade.
+
 macOS / Linux:
 
 ```bash
@@ -378,6 +380,7 @@ $env:RTT_NLLB_SOURCE_LANG="apc_Arab"
 
 ```
 run_production.py         Interpreter launcher (Next.js + API) — use this
+run_demo.py               Same UI + hardcoded target UX (no models; boss demo)
 run_ui.py                 Debug-only Gradio scratch UI (not the product)
 docker-compose.yml        Production stack (api + ui + Caddy HTTPS)
 docker/                   Dockerfiles, Caddyfile, entrypoints
