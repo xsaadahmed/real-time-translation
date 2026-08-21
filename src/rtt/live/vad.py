@@ -20,8 +20,9 @@ dependency and no download.
 
 Measured tradeoff: cutting at pauses produces *more* ASR passes, and on CPU a
 pass costs ~2.1s fixed regardless of length, so this costs about a second of
-lag. It is on by default anyway because it roughly triples how much of the
-transcript actually reaches the screen — see :class:`~rtt.config.VADConfig`.
+lag. It is off by default because, once reconcile_provisional aligns passes
+correctly, the fixed-window path wins on both lag and accuracy — see
+:class:`~rtt.config.VADConfig`.
 """
 
 from __future__ import annotations

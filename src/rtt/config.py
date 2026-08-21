@@ -201,28 +201,30 @@ class VADConfig:
     Uses the Silero model bundled with faster-whisper, so there is no extra
     dependency or download.
 
-    On by default, for accuracy rather than speed. It does cost latency:
-    cutting at pauses means *more* ASR passes, and a pass costs roughly 2.1s
+    Off by default: it costs latency and no longer buys accuracy.
+
+    Cutting at pauses means *more* ASR passes, and a pass costs roughly 2.1s
     fixed plus 0.09s per second of audio on a 20-core CPU with Whisper ``base``
     (Whisper pads every chunk to a fixed 30s mel window, so the fixed part
     dominates and pass count sets the bill).
 
-    It buys far more than it costs. Without it, a segment boundary lands
-    mid-utterance, consecutive passes disagree there, and
-    :func:`~rtt.text.reconcile_provisional` can only ever commit the leading
-    run they agree on — so most of the transcript is replaced rather than
-    committed and never reaches the screen. Measured over 52.9s of Arabic
+    This was briefly on by default, when it roughly tripled how much of the
+    transcript reached the screen. That gain turned out to be compensation for
+    a bug: :func:`~rtt.text.reconcile_provisional` compared two hypotheses that
+    start at different points in the audio, so it committed almost nothing, and
+    VAD's closed segments happened to bypass it. With the alignment fixed, the
+    fixed-window path wins on both axes. Measured over 52.9s of Arabic
     containing 77 words (scripts/bench_live_latency.py, two runs each):
 
-        VAD off:  median lag 2.8-3.4s, 12-14 words shown, WER 0.88-0.95
-        VAD on:   median lag 3.9-4.2s, 34-51 words shown, WER 0.56-0.79
+        VAD off:  median lag 3.4-3.7s, 57-58 words shown, WER 0.52-0.53
+        VAD on:   median lag 4.2-4.3s, 43-55 words shown, WER 0.57-0.64
 
-    Roughly three times the content for about a second of lag. Showing 15% of
-    what was said is not a usable translation at any latency, which is why this
-    is on despite being the slower option. Disable with ``RTT_LIVE_VAD=0``.
+    Still worth revisiting where a pass is cheap relative to the pauses it
+    exploits — on a GPU — or on noisy input where utterance boundaries are
+    harder to find by text alignment alone. Enable with ``RTT_LIVE_VAD=1``.
     """
 
-    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", True))
+    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", False))
     threshold: float = field(default_factory=lambda: float(_env("VAD_THRESHOLD", "0.5")))
     #: Silence after speech that closes an utterance. Too low and a mid-sentence
     #: breath splits the text; too high and the pause-to-text win shrinks.
