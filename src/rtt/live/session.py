@@ -17,10 +17,13 @@ from typing import Callable
 import numpy as np
 
 from ..audio import resample, save_wav, to_mono_float32
-from ..config import ASR_SAMPLE_RATE, SecondOpinionConfig
+from ..commit import CommitPolicy
+from ..config import ASR_SAMPLE_RATE, CommitPolicyConfig, SecondOpinionConfig
 from ..pipeline import TranslationPipeline
+from ..risk import RiskModel
 from ..second_opinion import SecondOpinionEngine, compare, log_record
-from ..text import merge_incremental_text, reconcile_provisional
+from ..text import check_structural_guards, merge_incremental_text, reconcile_provisional
+from ..tts import JitterBuffer, SpeculativeTTS, TTSEngine
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,11 @@ class LiveStreamState:
     arabic_verified: str = ""
     arabic_provisional: str = ""
     english_verified: str = ""
+    # Risk-committed: words the commit policy (step 9) has promoted out of
+    # english_provisional ahead of ASR agreement, because the risk model
+    # predicts they'll survive. Immutable once set - "no rollback, no
+    # correction" - same guarantee as english_verified, different mechanism.
+    english_risk_committed: str = ""
     english_provisional: str = ""
     status_message: str = "Click the microphone and speak Arabic."
     processed_samples: int = 0
@@ -48,6 +56,13 @@ class LiveStreamState:
     is_active: bool = False
     last_process_wall: float = 0.0
     chunks_received: int = 0
+    # How far (in captured-audio seconds) the risk-based commit policy has
+    # committed through. Lag for the lag governor is duration_sec() minus
+    # this - grows while ticks pass without a new risk commit, same as a
+    # real ear-voice span would.
+    committed_through_sec: float = 0.0
+    commit_theta: float = 0.0
+    commit_forced: bool = False
 
     @property
     def arabic_text(self) -> str:
@@ -55,7 +70,8 @@ class LiveStreamState:
 
     @property
     def english_text(self) -> str:
-        return " ".join(p for p in (self.english_verified, self.english_provisional) if p)
+        parts = (self.english_verified, self.english_risk_committed, self.english_provisional)
+        return " ".join(p for p in parts if p)
 
     def duration_sec(self) -> float:
         if self.audio.size == 0 or self.sample_rate <= 0:
@@ -93,6 +109,9 @@ class LiveSessionStore:
         live_pipeline: TranslationPipeline,
         final_pipeline_getter: Callable[[], TranslationPipeline],
         second_opinion_config: SecondOpinionConfig | None = None,
+        commit_policy_config: CommitPolicyConfig | None = None,
+        commit_policy: CommitPolicy | None = None,
+        tts_engine: TTSEngine | None = None,
     ) -> None:
         self.live_pipeline = live_pipeline
         self._get_final_pipeline = final_pipeline_getter
@@ -105,6 +124,57 @@ class LiveSessionStore:
         self._second_opinion_config = second_opinion_config or SecondOpinionConfig()
         self._second_opinion_engine: SecondOpinionEngine | None = None
         self._second_opinion_lock = threading.Lock()
+
+        # Risk-based commit policy + speculative TTS (steps 8-10). Off by
+        # default and degrades to the old guard-free reconcile_provisional
+        # behaviour if disabled or if the risk model can't be loaded -
+        # `commit_policy` lets tests/callers inject one directly (e.g. a
+        # model trained on synthetic records) instead of loading from disk.
+        self._commit_policy_config = commit_policy_config or CommitPolicyConfig()
+        self._commit_policy: CommitPolicy | None = commit_policy
+        self._commit_policy_load_failed = False
+        self._commit_policy_lock = threading.Lock()
+        self._tts_engine = tts_engine
+        self._speculative_tts: SpeculativeTTS | None = None
+        self._jitter_buffers: dict[str, JitterBuffer] = {}
+
+    def _get_commit_policy(self) -> CommitPolicy | None:
+        if self._commit_policy is not None:
+            return self._commit_policy
+        if not self._commit_policy_config.enabled or self._commit_policy_load_failed:
+            return None
+        with self._commit_policy_lock:
+            if self._commit_policy is not None or self._commit_policy_load_failed:
+                return self._commit_policy
+            try:
+                model = RiskModel.load(self._commit_policy_config.risk_model_path)
+                self._commit_policy = CommitPolicy(model)
+                logger.info(
+                    "Risk-based commit policy loaded from %s",
+                    self._commit_policy_config.risk_model_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not load risk model from %s - falling back to "
+                    "guard-free reconcile_provisional for this session",
+                    self._commit_policy_config.risk_model_path,
+                )
+                self._commit_policy_load_failed = True
+        return self._commit_policy
+
+    def _get_speculative_tts(self) -> SpeculativeTTS | None:
+        if not self._commit_policy_config.speculative_tts or self._tts_engine is None:
+            return None
+        if self._speculative_tts is None:
+            self._speculative_tts = SpeculativeTTS(self._tts_engine)
+        return self._speculative_tts
+
+    def jitter_buffer(self, session_id: str) -> JitterBuffer:
+        buf = self._jitter_buffers.get(session_id)
+        if buf is None:
+            buf = JitterBuffer()
+            self._jitter_buffers[session_id] = buf
+        return buf
 
     def create(self) -> LiveStreamState:
         state = LiveStreamState(
@@ -126,6 +196,7 @@ class LiveSessionStore:
         with self._lock:
             self._sessions.pop(session_id, None)
         self._processors_running.discard(session_id)
+        self._jitter_buffers.pop(session_id, None)
 
     def append_chunk(
         self,
@@ -240,6 +311,8 @@ class LiveSessionStore:
             else:
                 state.english_provisional = ""
 
+            self._apply_commit_policy(state)
+
         asr_s = asr_times.get("asr", 0.0)
         mt_s = mt_times.get("mt", 0.0)
         state.status_message = (
@@ -252,6 +325,82 @@ class LiveSessionStore:
             state.arabic_text[:120],
         )
         return state
+
+    def _apply_commit_policy(self, state: LiveStreamState) -> None:
+        """Risk-based early commit (steps 8-9) layered on top of the
+        ASR-agreement commits above: promotes a prefix of
+        ``state.english_provisional`` into ``english_risk_committed`` when
+        the risk model predicts it will survive, ahead of Whisper actually
+        re-confirming that Arabic. No-op (leaves the old behaviour exactly
+        as-is) when disabled or when no risk model could be loaded.
+        """
+        policy = self._get_commit_policy()
+        if policy is None:
+            return
+
+        locked = state.english_risk_committed
+        locked_words = locked.split()
+        provisional_words = state.english_provisional.split()
+
+        if provisional_words[: len(locked_words)] != locked_words:
+            # This tick's fresh retranslation no longer confirms the prefix
+            # we already risk-committed. Can't roll it back (immutable by
+            # construction) - just stop trying to extend it further this
+            # tick rather than compounding the misalignment.
+            logger.warning(
+                "Risk-committed prefix %r no longer confirmed by retranslation %r",
+                locked, state.english_provisional,
+            )
+            return
+
+        remainder_words = provisional_words[len(locked_words):]
+        if not remainder_words:
+            return
+
+        guard_result = check_structural_guards(state.arabic_text)
+        lag_sec = max(0.0, state.duration_sec() - state.committed_through_sec)
+        candidate_prefixes = [
+            " ".join(remainder_words[: n + 1]) for n in range(len(remainder_words))
+        ]
+
+        def feature_builder(candidate_suffix: str) -> dict:
+            candidate_text = merge_incremental_text(locked, candidate_suffix) if locked else candidate_suffix
+            return {
+                "session_id": state.session_id,
+                "tick": state.chunks_received,
+                "arabic_verified": state.arabic_verified,
+                "arabic_provisional": state.arabic_provisional,
+                "english_candidate": candidate_text,
+                "guard_hold": guard_result.hold,
+                "guard_name": guard_result.guard,
+                "agreement_depth": None,
+                "branch_count": 1,
+                "second_opinion_similarity": None,
+            }
+
+        spec = self._get_speculative_tts()
+        if spec is not None:
+            spec.speculate(state.english_provisional)
+
+        decision = policy.decide(candidate_prefixes, guard_result, lag_sec, feature_builder)
+        state.commit_theta = decision.theta
+        state.commit_forced = decision.forced
+        if not decision.committed_text:
+            return
+
+        state.english_risk_committed = (
+            merge_incremental_text(locked, decision.committed_text) if locked else decision.committed_text
+        )
+        state.english_provisional = " ".join(remainder_words[len(decision.committed_text.split()):])
+        state.committed_through_sec = state.duration_sec()
+
+        if spec is not None:
+            audio, was_hit = spec.commit(state.english_risk_committed)
+            self.jitter_buffer(state.session_id).push(audio)
+            logger.info(
+                "Risk-committed %r (speculative %s)",
+                decision.committed_text, "hit" if was_hit else "miss",
+            )
 
     def _run_final(self, state: LiveStreamState) -> LiveStreamState:
         """Full-buffer pass with the high-quality model."""
@@ -269,8 +418,10 @@ class LiveSessionStore:
         state.arabic_verified = arabic_text
         state.arabic_provisional = ""
         state.english_verified = english_text
+        state.english_risk_committed = ""
         state.english_provisional = ""
         state.processed_samples = state.audio.size
+        state.committed_through_sec = duration
 
         asr_s = asr_times.get("asr", 0.0)
         mt_s = mt_times.get("mt", 0.0)

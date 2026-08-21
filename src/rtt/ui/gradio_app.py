@@ -103,10 +103,25 @@ def get_store() -> LiveSessionStore:
                 live_cfg.asr.beam_size,
                 live_cfg.mt.backend,
             )
-            _live_pipeline = build_pipeline(live_cfg, include_tts=False)
+            # Speculative TTS (step 10) needs a real TTS engine even in the
+            # live pipeline; otherwise the live pipeline stays TTS-free, as
+            # before, since English audio is only synthesized on the final
+            # pass in the current UI.
+            needs_tts = _config.commit_policy.enabled and _config.commit_policy.speculative_tts
+            _live_pipeline = build_pipeline(live_cfg, include_tts=needs_tts)
             _store = LiveSessionStore(
-                _live_pipeline, _get_final_pipeline, _config.second_opinion
+                _live_pipeline,
+                _get_final_pipeline,
+                _config.second_opinion,
+                commit_policy_config=_config.commit_policy,
+                tts_engine=_live_pipeline.tts,
             )
+            if _config.commit_policy.enabled:
+                logger.info(
+                    "Risk-based commit policy: enabled (model=%s, speculative_tts=%s)",
+                    _config.commit_policy.risk_model_path,
+                    _config.commit_policy.speculative_tts,
+                )
             logger.info("Warming up live pipeline…")
             _live_pipeline.warmup()
     return _store

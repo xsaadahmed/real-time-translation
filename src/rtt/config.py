@@ -143,11 +143,30 @@ class SecondOpinionConfig:
 
 
 @dataclass
+class CommitPolicyConfig:
+    """Risk-based commit policy + speculative TTS (README steps 8-10).
+
+    Off by default: needs a risk model trained by
+    ``scripts/train_risk_model.py`` on a real harvest to be meaningful, and
+    silently degrades to the old guard-only reconciliation (text.py's
+    reconcile_provisional) if the model file is missing, rather than
+    breaking the live session.
+    """
+
+    enabled: bool = field(default_factory=lambda: _env_bool("RISK_COMMIT_ENABLED", False))
+    risk_model_path: str = field(
+        default_factory=lambda: _env("RISK_MODEL_PATH", str(MODEL_DIR / "risk_model.joblib"))
+    )
+    speculative_tts: bool = field(default_factory=lambda: _env_bool("SPECULATIVE_TTS", False))
+
+
+@dataclass
 class PipelineConfig:
     asr: ASRConfig = field(default_factory=ASRConfig)
     mt: MTConfig = field(default_factory=MTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     second_opinion: SecondOpinionConfig = field(default_factory=SecondOpinionConfig)
+    commit_policy: CommitPolicyConfig = field(default_factory=CommitPolicyConfig)
     output_dir: str = field(default_factory=lambda: _env("OUTPUT_DIR", str(OUTPUT_DIR)))
 
     @classmethod
@@ -171,6 +190,7 @@ class PipelineConfig:
 __all__ = [
     "ASR_SAMPLE_RATE",
     "ASRConfig",
+    "CommitPolicyConfig",
     "MODEL_DIR",
     "MTConfig",
     "OUTPUT_DIR",
