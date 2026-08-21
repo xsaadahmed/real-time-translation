@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 STREAM_INTERVAL_SEC = 0.5
 STREAM_TIME_LIMIT_SEC = 600
-UI_POLL_SEC = 0.3
+UI_POLL_SEC = float(os.environ.get("RTT_UI_POLL_SEC", "0.15"))
 
 _store: LiveSessionStore | None = None
 _live_pipeline: TranslationPipeline | None = None
@@ -52,6 +52,12 @@ def _live_config() -> PipelineConfig:
     cfg.asr.beam_size = 1
     cfg.asr.condition_on_previous_text = False
     cfg.asr.initial_prompt = ""
+    # Single temperature on the live path: a fallback re-decode costs more
+    # latency than the marginal quality is worth when the final pass will
+    # re-transcribe everything anyway. An explicit RTT_ASR_TEMPERATURES still
+    # wins, so the tradeoff stays measurable.
+    if os.environ.get("RTT_ASR_TEMPERATURES") is None:
+        cfg.asr.temperatures = (0.0,)
     live_mt = os.environ.get("RTT_LIVE_MT_BACKEND", "marian")
     cfg.mt.backend = live_mt
     if live_mt == "marian":

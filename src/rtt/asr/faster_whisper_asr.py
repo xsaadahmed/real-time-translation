@@ -31,12 +31,20 @@ class FasterWhisperASR(ASREngine):
         device = self.config.resolved_device()
         compute_type = self.config.resolved_compute_type()
         logger.info(
-            "Loading Whisper '%s' on %s (%s)", self.config.model_size, device, compute_type
+            "Loading Whisper '%s' on %s (%s), cpu_threads=%d num_workers=%d",
+            self.config.model_size,
+            device,
+            compute_type,
+            self.config.cpu_threads,
+            self.config.num_workers,
         )
         self._model = WhisperModel(
             self.config.model_size,
             device=device,
             compute_type=compute_type,
+            # Left unset, CTranslate2 pins itself to 4 threads on any machine.
+            cpu_threads=self.config.cpu_threads,
+            num_workers=self.config.num_workers,
             download_root=self.config.download_root,
         )
 
@@ -64,7 +72,7 @@ class FasterWhisperASR(ASREngine):
             "hallucination_silence_threshold": self.config.hallucination_silence_threshold,
             "repetition_penalty": self.config.repetition_penalty,
             "no_repeat_ngram_size": self.config.no_repeat_ngram_size,
-            "temperature": [0.0, 0.2, 0.4],
+            "temperature": list(self.config.temperatures),
         }
         prompt = self._initial_prompt()
         if prompt:

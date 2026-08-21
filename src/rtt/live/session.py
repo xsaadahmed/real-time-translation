@@ -8,6 +8,7 @@ for accuracy.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -24,10 +25,36 @@ from ..text import merge_incremental_text, reconcile_provisional
 
 logger = logging.getLogger(__name__)
 
-MIN_AUDIO_SEC = 0.8
-MIN_NEW_AUDIO_SEC = 2.0
-MIN_PROCESS_INTERVAL_SEC = 1.0
-LIVE_CONTEXT_SEC = 3.0
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(f"RTT_{name}", default))
+    except (TypeError, ValueError):
+        return default
+
+
+#: Shortest chunk worth sending to ASR at all.
+MIN_AUDIO_SEC = _env_float("LIVE_MIN_AUDIO_SEC", 0.8)
+#: How much fresh audio must accumulate before a pass runs.
+#:
+#: Tempting to lower this to cut lag, but it backfires: faster-whisper pads
+#: every chunk out to Whisper's fixed 30-second mel window, so a pass costs
+#: roughly the same whether it carries 1s or 6s of speech. Live ASR cost
+#: therefore tracks the number of passes, not their size. Measured over 52.9s
+#: of Arabic (scripts/bench_live_latency.py), dropping this to 0.8s raised ASR
+#: compute from 20.7s to 33.3s and median lag from 2.9s to 3.4s while decoding
+#: *less* audio. Around 2s — near one pass duration — is the sweet spot.
+MIN_NEW_AUDIO_SEC = _env_float("LIVE_MIN_NEW_AUDIO_SEC", 2.0)
+#: Floor on the gap between passes, so a fast machine does not spin. A pass
+#: already takes longer than this, so in practice it never binds.
+MIN_PROCESS_INTERVAL_SEC = _env_float("LIVE_PROCESS_INTERVAL_SEC", 1.0)
+#: Already-transcribed audio replayed before the new chunk so the decoder has
+#: context. Lowering this makes boundary text flicker and, because of the
+#: 30-second window above, saves no measurable time. Leave it alone.
+LIVE_CONTEXT_SEC = _env_float("LIVE_CONTEXT_SEC", 3.0)
+#: Processor-loop tick. Bounds how late a ready chunk starts decoding. Costs
+#: no extra ASR work, unlike the window above, so keep it small.
+LIVE_POLL_SEC = _env_float("LIVE_POLL_SEC", 0.05)
 
 
 @dataclass
@@ -48,6 +75,9 @@ class LiveStreamState:
     is_active: bool = False
     last_process_wall: float = 0.0
     chunks_received: int = 0
+    #: Arabic behind the current english_provisional, so an unchanged tail is
+    #: not retranslated on every pass.
+    provisional_source: str = ""
 
     @property
     def arabic_text(self) -> str:
@@ -191,7 +221,7 @@ class LiveSessionStore:
                 finally:
                     state.processing = False
 
-            time.sleep(0.2)
+            time.sleep(LIVE_POLL_SEC)
 
         self._processors_running.discard(session_id)
         logger.info("Live processor stopped for %s", session_id[:8])
@@ -201,6 +231,9 @@ class LiveSessionStore:
         context = int(LIVE_CONTEXT_SEC * ASR_SAMPLE_RATE)
         start = max(0, state.processed_samples - context)
         chunk = state.audio[start:]
+        # Pin the end of what we are about to decode. Audio keeps arriving on
+        # the capture thread while ASR runs, and it is NOT part of this chunk.
+        chunk_end = start + chunk.size
         chunk_sec = float(chunk.size) / float(ASR_SAMPLE_RATE)
 
         if chunk_sec < MIN_AUDIO_SEC:
@@ -220,8 +253,12 @@ class LiveSessionStore:
                 )
             state.arabic_provisional = provisional_ar
 
-            # Advance cursor — we consumed audio up to the current end.
-            state.processed_samples = state.audio.size
+            # Advance the cursor to the end of the audio we actually decoded,
+            # never to the live buffer end — anything captured during the pass
+            # above has not been transcribed yet and must survive for the next
+            # increment. Using state.audio.size here silently dropped every
+            # word spoken while ASR was running.
+            state.processed_samples = chunk_end
 
             mt_times: dict[str, float] = {}
             if newly_verified_ar:
@@ -235,14 +272,20 @@ class LiveSessionStore:
                 mt_times.update(verified_mt_times)
             if state.arabic_provisional:
                 # Provisional Arabic can still change, so its translation is
-                # always retranslated from scratch and fully replaced.
-                provisional_en, provisional_mt_times = self.live_pipeline.translate(
-                    state.arabic_provisional
-                )
-                state.english_provisional = provisional_en
-                mt_times.update(provisional_mt_times)
+                # retranslated from scratch and fully replaced — but only when
+                # the source actually moved. A pass that adds no new words to
+                # the tail would otherwise pay full MT cost for an identical
+                # result, and MT is the larger half of the live compute budget.
+                if state.arabic_provisional != state.provisional_source:
+                    provisional_en, provisional_mt_times = self.live_pipeline.translate(
+                        state.arabic_provisional
+                    )
+                    state.english_provisional = provisional_en
+                    state.provisional_source = state.arabic_provisional
+                    mt_times.update(provisional_mt_times)
             else:
                 state.english_provisional = ""
+                state.provisional_source = ""
 
         asr_s = asr_times.get("asr", 0.0)
         mt_s = mt_times.get("mt", 0.0)
@@ -272,6 +315,7 @@ class LiveSessionStore:
         # Full-buffer high-quality pass supersedes any provisional guesses.
         state.arabic_verified = arabic_text
         state.arabic_provisional = ""
+        state.provisional_source = ""
         state.english_verified = english_text
         state.english_provisional = ""
         state.processed_samples = state.audio.size
@@ -369,5 +413,6 @@ __all__ = [
     "LiveStreamState",
     "MIN_AUDIO_SEC",
     "MIN_NEW_AUDIO_SEC",
+    "LIVE_POLL_SEC",
     "merge_audio",
 ]

@@ -35,6 +35,38 @@ def _env_bool(name: str, default: bool) -> bool:
     return _env(name, "1" if default else "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_floats(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = _env(name, ",".join(str(value) for value in default))
+    try:
+        parsed = tuple(float(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        return default
+    return parsed or default
+
+
+def _default_cpu_threads() -> int:
+    """Threads for the CTranslate2 (Whisper) runtime.
+
+    faster-whisper passes ``cpu_threads=0`` straight through to CTranslate2,
+    which then defaults to 4 regardless of machine size — on a many-core host
+    that leaves most of the CPU idle. Half the logical cores, capped at 8,
+    scales without starving the MT stage that runs alongside it.
+    """
+    cores = os.cpu_count() or 4
+    return max(4, min(8, cores // 2))
+
+
+def _default_torch_threads() -> int:
+    """Threads for the torch (MT) runtime. ``0`` leaves torch's own default.
+
+    Measured on a 20-core host (scripts/bench_threads.py): torch's default of
+    14 translates a sentence in 0.33s, while pinning 4/8/12 threads costs
+    1.3x/2.9x/2.9x respectively. Torch already sizes this well and capping it
+    to "leave room" for ASR is a net loss, so do not override it by default.
+    """
+    return 0
+
+
 def detect_device() -> str:
     """Return ``"cuda"`` when a usable GPU is present, otherwise ``"cpu"``."""
     try:
@@ -72,6 +104,17 @@ class ASRConfig:
     no_repeat_ngram_size: int = field(
         default_factory=lambda: _env_int("ASR_NO_REPEAT_NGRAM", 3)
     )
+    # Whisper re-decodes a segment at each temperature in turn whenever the
+    # compression-ratio or log-prob check fails, so a 3-entry fallback is up to
+    # a 3x tail-latency spike. The live path overrides this to a single 0.0.
+    temperatures: tuple[float, ...] = field(
+        default_factory=lambda: _env_floats("ASR_TEMPERATURES", (0.0, 0.2, 0.4))
+    )
+    cpu_threads: int = field(
+        default_factory=lambda: _env_int("ASR_CPU_THREADS", _default_cpu_threads())
+    )
+    # Lets one pass decode while the next is being prepared.
+    num_workers: int = field(default_factory=lambda: _env_int("ASR_NUM_WORKERS", 2))
     download_root: str = field(default_factory=lambda: _env("ASR_DOWNLOAD_ROOT", str(MODEL_DIR / "whisper")))
 
     def resolved_device(self) -> str:
@@ -95,6 +138,9 @@ class MTConfig:
     num_beams: int = field(default_factory=lambda: _env_int("MT_BEAMS", 4))
     max_new_tokens: int = field(default_factory=lambda: _env_int("MT_MAX_NEW_TOKENS", 256))
     batch_size: int = field(default_factory=lambda: _env_int("MT_BATCH_SIZE", 8))
+    torch_threads: int = field(
+        default_factory=lambda: _env_int("MT_TORCH_THREADS", _default_torch_threads())
+    )
     # NLLB FLORES code. apc_Arab = North Levantine (Lebanon/Syria); arb_Arab = MSA.
     nllb_source_code: str = field(
         default_factory=lambda: _env("NLLB_SOURCE_LANG", "apc_Arab")

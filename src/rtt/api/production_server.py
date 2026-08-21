@@ -65,6 +65,10 @@ async def lifespan(_app: FastAPI):
         _executor.shutdown(wait=False, cancel_futures=True)
 
 
+#: How often the websocket checks session state for new text to push. This sits
+#: on top of the live pipeline's own latency, so keep it well under it.
+WS_POLL_SEC = float(os.environ.get("RTT_WS_POLL_SEC", "0.1"))
+
 app = FastAPI(title="RTT Production API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
@@ -159,7 +163,7 @@ async def _poll_updates(
             last_status = state.status_message
             await _send_state(websocket, state, phase="listening")
 
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(WS_POLL_SEC)
 
 
 @app.get("/health")
