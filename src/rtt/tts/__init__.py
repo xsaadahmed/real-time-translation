@@ -8,6 +8,7 @@ from ..config import TTSConfig
 from .base import SpeechAudio, TTSEngine
 from .neural import KokoroTTS, PiperTTS
 from .sapi import SapiTTS
+from .speculative import JitterBuffer, JitterBufferConfig, ShadowClip, SpeculativeTTS
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,13 @@ def build_tts(config: TTSConfig | None = None) -> TTSEngine:
 __all__ = [
     "AUTO_ORDER",
     "BACKENDS",
+    "JitterBuffer",
+    "JitterBufferConfig",
     "KokoroTTS",
     "PiperTTS",
     "SapiTTS",
+    "ShadowClip",
+    "SpeculativeTTS",
     "SpeechAudio",
     "TTSEngine",
     "build_tts",
