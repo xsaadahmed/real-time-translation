@@ -50,6 +50,7 @@ class _Instrumented:
         self.asr_audio_seconds = 0.0
         self.mt_calls = 0
         self.mt_seconds = 0.0
+        self.passes: list[dict] = []
 
     def __getattr__(self, item):
         return getattr(self._inner, item)
@@ -57,9 +58,18 @@ class _Instrumented:
     def transcribe(self, audio, sample_rate):
         started = time.perf_counter()
         result = self._inner.transcribe(audio, sample_rate)
-        self.asr_seconds += time.perf_counter() - started
-        self.asr_audio_seconds += float(np.asarray(audio).size) / float(sample_rate)
+        elapsed = time.perf_counter() - started
+        chunk_sec = float(np.asarray(audio).size) / float(sample_rate)
+        self.asr_seconds += elapsed
+        self.asr_audio_seconds += chunk_sec
         self.asr_calls += 1
+        self.passes.append(
+            {
+                "chunk_sec": round(chunk_sec, 2),
+                "asr_sec": round(elapsed, 2),
+                "chars": len(result[0] or ""),
+            }
+        )
         return result
 
     def translate(self, text):
@@ -80,20 +90,35 @@ def _track_coverage(store: LiveSessionStore, stats: dict) -> None:
     from rtt.live import session as session_mod
 
     original = store._run_live_increment
+    original_next = store._next_segment
 
-    def wrapped(state):
+    def wrapped(state, chunk_end=None, closed=False):
         before = state.processed_samples
         context = int(session_mod.LIVE_CONTEXT_SEC * ASR_SAMPLE_RATE)
         start = max(0, before - context)
-        chunk_end = state.audio.size  # what the pass is about to snapshot
-        result = original(state)
+        decoded_to = state.audio.size if chunk_end is None else chunk_end
+        result = original(state, chunk_end=chunk_end, closed=closed)
         after = state.processed_samples
         if after > before:
-            stats["skipped_samples"] += max(0, after - chunk_end)
-            stats["decoded_span"] += max(0, min(after, chunk_end) - start)
+            stats["skipped_samples"] += max(0, after - decoded_to)
+            stats["decoded_span"] += max(0, min(after, decoded_to) - start)
+        if closed:
+            stats["closed_segments"] += 1
+        else:
+            stats["open_segments"] += 1
         return result
 
+    def wrapped_next(state):
+        decision = original_next(state)
+        # Silence skipping advances the cursor without an ASR pass. That is
+        # intentional, but if the detector misfires it is lost speech, so track
+        # it separately rather than folding it into either bucket.
+        if decision is not None and decision.skip_asr:
+            stats["silence_skipped"] += max(0, decision.end - state.processed_samples)
+        return decision
+
     store._run_live_increment = wrapped
+    store._next_segment = wrapped_next
 
 
 def _build_store() -> tuple[LiveSessionStore, _Instrumented]:
@@ -127,7 +152,13 @@ def run(
     if warmup_only:
         return {}
 
-    coverage = {"skipped_samples": 0, "decoded_span": 0}
+    coverage = {
+        "skipped_samples": 0,
+        "decoded_span": 0,
+        "silence_skipped": 0,
+        "closed_segments": 0,
+        "open_segments": 0,
+    }
     _track_coverage(store, coverage)
 
     state = store.create()
@@ -206,11 +237,15 @@ def run(
             if duration
             else None
         ),
+        "silence_skipped_sec": round(coverage["silence_skipped"] / ASR_SAMPLE_RATE, 2),
+        "closed_segments": coverage["closed_segments"],
+        "open_segments": coverage["open_segments"],
         "mt_calls": live_mt_calls,
         "mt_compute_sec": round(live_mt_s, 2),
         "finalize_sec": final_sec,
         "live_arabic": live_arabic[:200],
         "live_english": live_english[:200],
+        "passes": live.passes,
         "trace": samples,
     }
     return result
@@ -228,7 +263,12 @@ def _report(r: dict) -> None:
         f"  SKIPPED audio never transcribed: {r['audio_skipped_sec']}s "
         f"({r['audio_skipped_pct']}% of the stream)"
     )
+    print(
+        f"  silence skipped without ASR: {r['silence_skipped_sec']}s | "
+        f"segments: {r['closed_segments']} closed, {r['open_segments']} open"
+    )
     print(f"  MT   {r['mt_calls']} calls, {r['mt_compute_sec']}s compute")
+    print("  per pass: " + ", ".join(f"{p['chunk_sec']}s/{p['asr_sec']}s" for p in r.get("passes", [])))
     if r.get("finalize_sec") is not None:
         print(f"  finalize (full buffer, medium): {r['finalize_sec']}s")
     print(f"  EN: {r['live_english'][:160]}")

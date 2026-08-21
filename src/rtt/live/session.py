@@ -18,10 +18,11 @@ from typing import Callable
 import numpy as np
 
 from ..audio import resample, save_wav, to_mono_float32
-from ..config import ASR_SAMPLE_RATE, SecondOpinionConfig
+from ..config import ASR_SAMPLE_RATE, SecondOpinionConfig, VADConfig
 from ..pipeline import TranslationPipeline
 from ..second_opinion import SecondOpinionEngine, compare, log_record
 from ..text import merge_incremental_text, reconcile_provisional
+from .vad import SegmentDecision, SpeechSegmenter
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +124,13 @@ class LiveSessionStore:
         live_pipeline: TranslationPipeline,
         final_pipeline_getter: Callable[[], TranslationPipeline],
         second_opinion_config: SecondOpinionConfig | None = None,
+        vad_config: VADConfig | None = None,
     ) -> None:
         self.live_pipeline = live_pipeline
+        self._vad_config = vad_config or VADConfig()
+        self._segmenter = (
+            SpeechSegmenter(self._vad_config) if self._vad_config.enabled else None
+        )
         self._get_final_pipeline = final_pipeline_getter
         self._sessions: dict[str, LiveStreamState] = {}
         self._lock = threading.Lock()
@@ -203,37 +209,65 @@ class LiveSessionStore:
             if state is None or not state.is_active:
                 break
 
-            now = time.time()
-            should_run = (
-                state.new_audio_sec() >= MIN_NEW_AUDIO_SEC
-                and not state.processing
-                and (now - state.last_process_wall) >= MIN_PROCESS_INTERVAL_SEC
-            )
-
-            if should_run:
-                state.processing = True
-                try:
-                    self._run_live_increment(state)
-                    state.last_process_wall = time.time()
-                except Exception:
-                    logger.exception("Live transcription failed")
-                    state.status_message = "Transcription error — retrying…"
-                finally:
-                    state.processing = False
+            if not state.processing:
+                decision = self._next_segment(state)
+                if decision is not None and decision.skip_asr:
+                    # Pure silence: advance past it without an ASR pass at all.
+                    logger.debug(
+                        "Skipping %.2fs of silence",
+                        (decision.end - state.processed_samples) / ASR_SAMPLE_RATE,
+                    )
+                    state.processed_samples = decision.end
+                elif decision is not None:
+                    state.processing = True
+                    try:
+                        self._run_live_increment(
+                            state, chunk_end=decision.end, closed=decision.closed
+                        )
+                        state.last_process_wall = time.time()
+                    except Exception:
+                        logger.exception("Live transcription failed")
+                        state.status_message = "Transcription error — retrying…"
+                    finally:
+                        state.processing = False
 
             time.sleep(LIVE_POLL_SEC)
 
         self._processors_running.discard(session_id)
         logger.info("Live processor stopped for %s", session_id[:8])
 
-    def _run_live_increment(self, state: LiveStreamState) -> LiveStreamState:
+    def _next_segment(self, state: LiveStreamState) -> "SegmentDecision | None":
+        """Where to cut the pending audio, or ``None`` to keep listening.
+
+        With VAD enabled this tracks the speaker's pauses. Without it, this
+        reproduces the original fixed-window schedule, which keeps the two
+        strategies directly comparable in the benchmark.
+        """
+        if self._segmenter is not None:
+            return self._segmenter.decide(state.audio, state.processed_samples)
+
+        now = time.time()
+        if (
+            state.new_audio_sec() >= MIN_NEW_AUDIO_SEC
+            and (now - state.last_process_wall) >= MIN_PROCESS_INTERVAL_SEC
+        ):
+            return SegmentDecision(end=state.audio.size, closed=False, speech=True)
+        return None
+
+    def _run_live_increment(
+        self,
+        state: LiveStreamState,
+        chunk_end: int | None = None,
+        closed: bool = False,
+    ) -> LiveStreamState:
         """Transcribe only the new audio since the last pass (fast path)."""
         context = int(LIVE_CONTEXT_SEC * ASR_SAMPLE_RATE)
         start = max(0, state.processed_samples - context)
-        chunk = state.audio[start:]
         # Pin the end of what we are about to decode. Audio keeps arriving on
         # the capture thread while ASR runs, and it is NOT part of this chunk.
-        chunk_end = start + chunk.size
+        if chunk_end is None:
+            chunk_end = state.audio.size
+        chunk = state.audio[start:chunk_end]
         chunk_sec = float(chunk.size) / float(ASR_SAMPLE_RATE)
 
         if chunk_sec < MIN_AUDIO_SEC:
@@ -244,9 +278,16 @@ class LiveSessionStore:
 
         with self._process_lock:
             arabic_new, _, asr_times = self.live_pipeline.transcribe(chunk, state.sample_rate)
-            newly_verified_ar, provisional_ar = reconcile_provisional(
-                state.arabic_provisional, arabic_new
-            )
+            if closed:
+                # The segment ends on silence, so no later audio can revise
+                # these words. Commit the whole hypothesis instead of holding a
+                # tail back for a second pass to confirm — that second pass is
+                # exactly the wait the fixed-window scheduler imposed.
+                newly_verified_ar, provisional_ar = arabic_new, ""
+            else:
+                newly_verified_ar, provisional_ar = reconcile_provisional(
+                    state.arabic_provisional, arabic_new
+                )
             if newly_verified_ar:
                 state.arabic_verified = merge_incremental_text(
                     state.arabic_verified, newly_verified_ar

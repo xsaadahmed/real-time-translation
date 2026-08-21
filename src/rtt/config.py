@@ -189,11 +189,79 @@ class SecondOpinionConfig:
 
 
 @dataclass
+class VADConfig:
+    """Voice-activity segmentation for the live path.
+
+    Without this, live passes fire on a fixed timer, so the end of an utterance
+    waits out the remainder of the window before it can be shown. Cutting on
+    the silence that follows speech instead lets a finished sentence be
+    translated the moment the speaker pauses, and lets pure silence be skipped
+    without spending an ASR pass on it.
+
+    Uses the Silero model bundled with faster-whisper, so there is no extra
+    dependency or download.
+
+    Off by default, because on CPU it currently loses. Cutting at pauses means
+    *more* ASR passes, and a pass costs roughly 2.1s fixed plus 0.09s per
+    second of audio on a 20-core CPU with Whisper ``base`` — Whisper pads every
+    chunk to a fixed 30s mel window, so the fixed part dominates. Measured
+    back-to-back over 52.9s of Arabic (scripts/bench_live_latency.py):
+
+        VAD off:  11 passes, 28.7s ASR, median lag 4.25s
+        VAD on:   14 passes, 35.9s ASR, median lag 4.67s
+
+    The extra passes cost more latency than cutting at pauses saves, so this
+    only becomes worthwhile once a pass is cheaper than the pauses it exploits
+    — on a GPU, or with a smaller live model. Transcript quality is visibly
+    better with it on (segments break at utterance boundaries instead of
+    mid-word), so it is worth revisiting there. Enable with ``RTT_LIVE_VAD=1``.
+    """
+
+    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", False))
+    threshold: float = field(default_factory=lambda: float(_env("VAD_THRESHOLD", "0.5")))
+    #: Silence after speech that closes an utterance. Too low and a mid-sentence
+    #: breath splits the text; too high and the pause-to-text win shrinks.
+    min_silence_ms: int = field(default_factory=lambda: _env_int("VAD_MIN_SILENCE_MS", 300))
+    #: Audio kept after the detected end of speech, so a trailing consonant is
+    #: not clipped off the segment.
+    speech_pad_ms: int = field(default_factory=lambda: _env_int("VAD_SPEECH_PAD_MS", 200))
+    #: Ignore speech runs shorter than this — coughs, clicks, mic bumps.
+    min_speech_ms: int = field(default_factory=lambda: _env_int("VAD_MIN_SPEECH_MS", 150))
+    #: Force a pass during unbroken speech that never pauses. Whisper pads every
+    #: chunk to a fixed 30s window, so a larger value costs no more per pass but
+    #: adds directly to lag during a monologue. Keep it near the old fixed
+    #: window rather than large.
+    max_segment_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MAX_SEGMENT_SEC", "2.5"))
+    )
+    #: Pure silence longer than this is skipped outright: the cursor advances
+    #: with no ASR pass at all.
+    silence_skip_sec: float = field(
+        default_factory=lambda: float(_env("VAD_SILENCE_SKIP_SEC", "1.5"))
+    )
+    #: Do not even run the detector until this much new audio has arrived.
+    min_pending_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MIN_PENDING_SEC", "0.3"))
+    )
+    #: Minimum new audio between two detector runs.
+    #:
+    #: The processor loop ticks every 50ms, but detection costs ~17ms per 2s of
+    #: audio, so running it every tick burns roughly a third of a core and
+    #: starves ASR — measured as live ASR compute rising 22.5s -> 36.4s. Gating
+    #: on new audio instead caps it near four runs a second, at the cost of
+    #: noticing a pause up to this late.
+    min_check_step_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MIN_CHECK_STEP_SEC", "0.25"))
+    )
+
+
+@dataclass
 class PipelineConfig:
     asr: ASRConfig = field(default_factory=ASRConfig)
     mt: MTConfig = field(default_factory=MTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     second_opinion: SecondOpinionConfig = field(default_factory=SecondOpinionConfig)
+    vad: VADConfig = field(default_factory=VADConfig)
     output_dir: str = field(default_factory=lambda: _env("OUTPUT_DIR", str(OUTPUT_DIR)))
 
     @classmethod
@@ -224,5 +292,6 @@ __all__ = [
     "PipelineConfig",
     "SecondOpinionConfig",
     "TTSConfig",
+    "VADConfig",
     "detect_device",
 ]
