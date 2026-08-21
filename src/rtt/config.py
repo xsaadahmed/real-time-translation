@@ -35,6 +35,38 @@ def _env_bool(name: str, default: bool) -> bool:
     return _env(name, "1" if default else "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_floats(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = _env(name, ",".join(str(value) for value in default))
+    try:
+        parsed = tuple(float(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        return default
+    return parsed or default
+
+
+def _default_cpu_threads() -> int:
+    """Threads for the CTranslate2 (Whisper) runtime.
+
+    faster-whisper passes ``cpu_threads=0`` straight through to CTranslate2,
+    which then defaults to 4 regardless of machine size — on a many-core host
+    that leaves most of the CPU idle. Half the logical cores, capped at 8,
+    scales without starving the MT stage that runs alongside it.
+    """
+    cores = os.cpu_count() or 4
+    return max(4, min(8, cores // 2))
+
+
+def _default_torch_threads() -> int:
+    """Threads for the torch (MT) runtime. ``0`` leaves torch's own default.
+
+    Measured on a 20-core host (scripts/bench_threads.py): torch's default of
+    14 translates a sentence in 0.33s, while pinning 4/8/12 threads costs
+    1.3x/2.9x/2.9x respectively. Torch already sizes this well and capping it
+    to "leave room" for ASR is a net loss, so do not override it by default.
+    """
+    return 0
+
+
 def detect_device() -> str:
     """Return ``"cuda"`` when a usable GPU is present, otherwise ``"cpu"``."""
     try:
@@ -72,6 +104,17 @@ class ASRConfig:
     no_repeat_ngram_size: int = field(
         default_factory=lambda: _env_int("ASR_NO_REPEAT_NGRAM", 3)
     )
+    # Whisper re-decodes a segment at each temperature in turn whenever the
+    # compression-ratio or log-prob check fails, so a 3-entry fallback is up to
+    # a 3x tail-latency spike. The live path overrides this to a single 0.0.
+    temperatures: tuple[float, ...] = field(
+        default_factory=lambda: _env_floats("ASR_TEMPERATURES", (0.0, 0.2, 0.4))
+    )
+    cpu_threads: int = field(
+        default_factory=lambda: _env_int("ASR_CPU_THREADS", _default_cpu_threads())
+    )
+    # Lets one pass decode while the next is being prepared.
+    num_workers: int = field(default_factory=lambda: _env_int("ASR_NUM_WORKERS", 2))
     download_root: str = field(default_factory=lambda: _env("ASR_DOWNLOAD_ROOT", str(MODEL_DIR / "whisper")))
 
     def resolved_device(self) -> str:
@@ -95,6 +138,9 @@ class MTConfig:
     num_beams: int = field(default_factory=lambda: _env_int("MT_BEAMS", 4))
     max_new_tokens: int = field(default_factory=lambda: _env_int("MT_MAX_NEW_TOKENS", 256))
     batch_size: int = field(default_factory=lambda: _env_int("MT_BATCH_SIZE", 8))
+    torch_threads: int = field(
+        default_factory=lambda: _env_int("MT_TORCH_THREADS", _default_torch_threads())
+    )
     # NLLB FLORES code. apc_Arab = North Levantine (Lebanon/Syria); arb_Arab = MSA.
     nllb_source_code: str = field(
         default_factory=lambda: _env("NLLB_SOURCE_LANG", "apc_Arab")
@@ -143,11 +189,86 @@ class SecondOpinionConfig:
 
 
 @dataclass
+class VADConfig:
+    """Voice-activity segmentation for the live path.
+
+    Without this, live passes fire on a fixed timer, so the end of an utterance
+    waits out the remainder of the window before it can be shown. Cutting on
+    the silence that follows speech instead lets a finished sentence be
+    translated the moment the speaker pauses, and lets pure silence be skipped
+    without spending an ASR pass on it.
+
+    Uses the Silero model bundled with faster-whisper, so there is no extra
+    dependency or download.
+
+    Off by default: it costs latency and no longer buys accuracy.
+
+    Cutting at pauses means *more* ASR passes, and a pass costs roughly 2.1s
+    fixed plus 0.09s per second of audio on a 20-core CPU with Whisper ``base``
+    (Whisper pads every chunk to a fixed 30s mel window, so the fixed part
+    dominates and pass count sets the bill).
+
+    This was briefly on by default, when it roughly tripled how much of the
+    transcript reached the screen. That gain turned out to be compensation for
+    a bug: :func:`~rtt.text.reconcile_provisional` compared two hypotheses that
+    start at different points in the audio, so it committed almost nothing, and
+    VAD's closed segments happened to bypass it. With the alignment fixed, the
+    fixed-window path wins on both axes. Measured over 52.9s of Arabic
+    containing 77 words (scripts/bench_live_latency.py, two runs each):
+
+        VAD off:  median lag 3.4-3.7s, 57-58 words shown, WER 0.52-0.53
+        VAD on:   median lag 4.2-4.3s, 43-55 words shown, WER 0.57-0.64
+
+    Still worth revisiting where a pass is cheap relative to the pauses it
+    exploits — on a GPU — or on noisy input where utterance boundaries are
+    harder to find by text alignment alone. Enable with ``RTT_LIVE_VAD=1``.
+    """
+
+    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", False))
+    threshold: float = field(default_factory=lambda: float(_env("VAD_THRESHOLD", "0.5")))
+    #: Silence after speech that closes an utterance. Too low and a mid-sentence
+    #: breath splits the text; too high and the pause-to-text win shrinks.
+    min_silence_ms: int = field(default_factory=lambda: _env_int("VAD_MIN_SILENCE_MS", 300))
+    #: Audio kept after the detected end of speech, so a trailing consonant is
+    #: not clipped off the segment.
+    speech_pad_ms: int = field(default_factory=lambda: _env_int("VAD_SPEECH_PAD_MS", 200))
+    #: Ignore speech runs shorter than this — coughs, clicks, mic bumps.
+    min_speech_ms: int = field(default_factory=lambda: _env_int("VAD_MIN_SPEECH_MS", 150))
+    #: Force a pass during unbroken speech that never pauses. Whisper pads every
+    #: chunk to a fixed 30s window, so a larger value costs no more per pass but
+    #: adds directly to lag during a monologue. Keep it near the old fixed
+    #: window rather than large.
+    max_segment_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MAX_SEGMENT_SEC", "2.5"))
+    )
+    #: Pure silence longer than this is skipped outright: the cursor advances
+    #: with no ASR pass at all.
+    silence_skip_sec: float = field(
+        default_factory=lambda: float(_env("VAD_SILENCE_SKIP_SEC", "1.5"))
+    )
+    #: Do not even run the detector until this much new audio has arrived.
+    min_pending_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MIN_PENDING_SEC", "0.3"))
+    )
+    #: Minimum new audio between two detector runs.
+    #:
+    #: The processor loop ticks every 50ms, but detection costs ~17ms per 2s of
+    #: audio, so running it every tick burns roughly a third of a core and
+    #: starves ASR — measured as live ASR compute rising 22.5s -> 36.4s. Gating
+    #: on new audio instead caps it near four runs a second, at the cost of
+    #: noticing a pause up to this late.
+    min_check_step_sec: float = field(
+        default_factory=lambda: float(_env("VAD_MIN_CHECK_STEP_SEC", "0.25"))
+    )
+
+
+@dataclass
 class PipelineConfig:
     asr: ASRConfig = field(default_factory=ASRConfig)
     mt: MTConfig = field(default_factory=MTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     second_opinion: SecondOpinionConfig = field(default_factory=SecondOpinionConfig)
+    vad: VADConfig = field(default_factory=VADConfig)
     output_dir: str = field(default_factory=lambda: _env("OUTPUT_DIR", str(OUTPUT_DIR)))
 
     @classmethod
@@ -178,5 +299,6 @@ __all__ = [
     "PipelineConfig",
     "SecondOpinionConfig",
     "TTSConfig",
+    "VADConfig",
     "detect_device",
 ]

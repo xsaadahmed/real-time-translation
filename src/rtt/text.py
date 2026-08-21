@@ -120,6 +120,53 @@ def merge_incremental_text(existing: str, new: str) -> str:
     return f"{existing} {new}"
 
 
+#: Fraction of words that must match for an overlap to be believed. ASR revises
+#: wording between passes (منزل التفولة -> منذ الطفولة), so requiring an exact
+#: match finds no overlap at all on real output; half the words agreeing is
+#: strong evidence for the same span of audio.
+_ALIGN_MIN_AGREEMENT = 0.5
+
+
+def _align_shift(old_words: list[str], new_words: list[str]) -> int | None:
+    """Find the shift that lines the two hypotheses up, or ``None``.
+
+    Returns ``s`` such that ``old_words[i]`` describes the same audio as
+    ``new_words[i + s]``. It runs in both directions because both happen:
+
+    * ``s < 0`` — the live path, where a pass replays some context and so
+      starts *later* than the previous provisional began.
+    * ``s > 0`` — a cumulative transcriber (the harvester's), which re-reports
+      the whole utterance from the beginning every tick, and so starts
+      *earlier* than the previous tail.
+
+    Candidates are scored by how many words actually match, preferring the
+    alignment with the most evidence rather than the first one that clears the
+    threshold — a lone coincidental match should not beat a long agreeing run.
+    """
+    best_key: tuple[int, float] | None = None
+    best_shift: int | None = None
+
+    for shift in range(-(len(old_words) - 1), len(new_words)):
+        low = max(0, -shift)
+        high = min(len(old_words), len(new_words) - shift)
+        span = high - low
+        if span <= 0:
+            continue
+        matches = sum(
+            1 for i in range(low, high) if old_words[i] == new_words[i + shift]
+        )
+        if not matches:
+            continue
+        ratio = matches / span
+        if ratio < _ALIGN_MIN_AGREEMENT:
+            continue
+        key = (matches, ratio)
+        if best_key is None or key > best_key:
+            best_key, best_shift = key, shift
+
+    return best_shift
+
+
 def reconcile_provisional(old_provisional: str, new_hypothesis: str) -> tuple[str, str]:
     """Reconcile a fresh ASR hypothesis against the previous provisional tail.
 
@@ -137,6 +184,25 @@ def reconcile_provisional(old_provisional: str, new_hypothesis: str) -> tuple[st
     vs ``كتابه``) does not match and is correctly kept provisional rather
     than verified as a partial word.
 
+    The two strings do not start at the same point in the audio, and assuming
+    they do is what made this lose most of the transcript. A pass decodes
+    ``LIVE_CONTEXT_SEC`` of already-seen audio before the new material, so a
+    fresh hypothesis typically begins somewhere *inside* the previous
+    provisional rather than at its first word::
+
+        old: بالهي جزء أساسي من الهوية. في بيروت تسمع العربية والفرسية
+        new:                              تسمع العربية والفرسية في الشارع
+
+    Compared from index 0 those disagree immediately, nothing is ever promoted,
+    and each pass discards its predecessor. Measured, 13 of 14 passes committed
+    zero words. So the overlap is located first, and only then compared.
+
+    Words of ``old_provisional`` that fall *before* the overlap are already
+    outside the re-transcription window — no later pass will look at that audio
+    again. They are committed rather than dropped: single-pass text is worth
+    more than silence, and holding out for a confirmation that can never arrive
+    is what lost them.
+
     Returns ``(newly_verified, remaining_provisional)``.
     """
     old_provisional = normalize_arabic(old_provisional)
@@ -150,14 +216,37 @@ def reconcile_provisional(old_provisional: str, new_hypothesis: str) -> tuple[st
 
     old_words = old_provisional.split()
     new_words = new_hypothesis.split()
+
+    shift = _align_shift(old_words, new_words)
+    if shift is None:
+        # The two passes have nothing in common — a long silence, or the
+        # speaker moved on entirely. Keep the fresh hypothesis and commit
+        # nothing, as before.
+        return "", new_hypothesis
+
+    if shift <= 0:
+        # New pass starts inside the old tail. What precedes it has aged out of
+        # the window and will never be re-transcribed, so commit it.
+        offset = -shift
+        aged_out = old_words[:offset]
+        old_tail = old_words[offset:]
+        new_start = 0
+    else:
+        # New pass reaches back before the old tail. That earlier span is
+        # already committed, so skip it rather than emitting it twice.
+        aged_out = []
+        old_tail = old_words
+        new_start = shift
+
     agree = 0
-    for old_word, new_word in zip(old_words, new_words):
+    for old_word, new_word in zip(old_tail, new_words[new_start:]):
         if old_word != new_word:
             break
         agree += 1
 
-    newly_verified = " ".join(new_words[:agree])
-    remaining_provisional = " ".join(new_words[agree:])
+    # Aged-out words first, then the run this pass confirms.
+    newly_verified = " ".join(aged_out + new_words[new_start : new_start + agree])
+    remaining_provisional = " ".join(new_words[new_start + agree :])
     return newly_verified, remaining_provisional
 
 

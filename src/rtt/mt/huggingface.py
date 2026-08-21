@@ -52,7 +52,16 @@ class HuggingFaceTranslator(Translator):
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         device = self.config.resolved_device()
-        logger.info("Loading translation model '%s' on %s", self.model_name, device)
+        if device == "cpu" and self.config.torch_threads > 0:
+            # Sized in config to leave headroom for the CTranslate2 ASR runtime
+            # rather than both stages claiming every core.
+            torch.set_num_threads(self.config.torch_threads)
+        logger.info(
+            "Loading translation model '%s' on %s (torch_threads=%d)",
+            self.model_name,
+            device,
+            self.config.torch_threads,
+        )
 
         tokenizer_kwargs = {"cache_dir": self.config.cache_dir}
         if self._is_nllb:
