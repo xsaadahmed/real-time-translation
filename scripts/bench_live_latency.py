@@ -80,6 +80,32 @@ class _Instrumented:
         return result
 
 
+def _word_error_rate(reference: str, hypothesis: str) -> float | None:
+    """Word error rate of the live Arabic against the reference transcript.
+
+    A speed win that quietly wrecks accuracy is not a win, so the benchmark has
+    to price both. Plain Levenshtein over normalised words — no jiwer
+    dependency for one metric.
+    """
+    from rtt.text import normalize_arabic
+
+    ref = normalize_arabic(reference).split()
+    hyp = normalize_arabic(hypothesis).split()
+    if not ref:
+        return None
+
+    previous = list(range(len(hyp) + 1))
+    for i, ref_word in enumerate(ref, start=1):
+        current = [i]
+        for j, hyp_word in enumerate(hyp, start=1):
+            cost = 0 if ref_word == hyp_word else 1
+            current.append(
+                min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            )
+        previous = current
+    return previous[-1] / len(ref)
+
+
 def _track_coverage(store: LiveSessionStore, stats: dict) -> None:
     """Record how much captured audio the live path actually transcribed.
 
@@ -188,9 +214,11 @@ def run(
             time.sleep(0.02)
         store.append_chunk(state.session_id, ASR_SAMPLE_RATE, chunk)
 
-    # Drain: let the last in-flight pass land before finalizing.
+    # Drain: let the backlog land before scoring, so word error rate measures
+    # transcription quality rather than how far behind the config finished.
+    # Lag is reported separately and already captures that.
     drain_started = time.perf_counter()
-    while time.perf_counter() - drain_started < 15.0:
+    while time.perf_counter() - drain_started < 40.0:
         if state.english_text != last_text:
             now = time.perf_counter()
             last_text = state.english_text
@@ -206,6 +234,12 @@ def run(
     live_asr_calls, live_asr_s = live.asr_calls, live.asr_seconds
     live_audio_s, live_mt_s = live.asr_audio_seconds, live.mt_seconds
     live_mt_calls = live.mt_calls
+
+    reference_path = wav.with_suffix(".txt")
+    reference = (
+        reference_path.read_text(encoding="utf-8") if reference_path.exists() else ""
+    )
+    wer = _word_error_rate(reference, live_arabic) if reference else None
 
     final_sec = None
     if do_finalize:
@@ -231,6 +265,9 @@ def run(
         "asr_redundancy": (
             round(live_audio_s / duration, 2) if duration else None
         ),
+        "wer": (round(wer, 3) if wer is not None else None),
+        "live_words": len(live_arabic.split()),
+        "reference_words": len(reference.split()) if reference else 0,
         "audio_skipped_sec": round(coverage["skipped_samples"] / ASR_SAMPLE_RATE, 2),
         "audio_skipped_pct": (
             round(100.0 * coverage["skipped_samples"] / ASR_SAMPLE_RATE / duration, 1)
@@ -268,6 +305,11 @@ def _report(r: dict) -> None:
         f"segments: {r['closed_segments']} closed, {r['open_segments']} open"
     )
     print(f"  MT   {r['mt_calls']} calls, {r['mt_compute_sec']}s compute")
+    if r.get("wer") is not None:
+        print(
+            f"  Arabic WER {r['wer']:.3f}  "
+            f"({r['live_words']} words transcribed vs {r['reference_words']} reference)"
+        )
     print("  per pass: " + ", ".join(f"{p['chunk_sec']}s/{p['asr_sec']}s" for p in r.get("passes", [])))
     if r.get("finalize_sec") is not None:
         print(f"  finalize (full buffer, medium): {r['finalize_sec']}s")

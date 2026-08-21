@@ -18,10 +18,10 @@ provisional guess that gets retranslated on every pass.
 Detection uses the Silero model bundled with faster-whisper, so this adds no
 dependency and no download.
 
-Measured caveat, and the reason :class:`~rtt.config.VADConfig` defaults to off:
-cutting at pauses produces *more* ASR passes, and on CPU a pass costs ~2.1s
-fixed regardless of its length. The extra passes currently cost more than the
-pause-triggered emission saves. See VADConfig for the numbers.
+Measured tradeoff: cutting at pauses produces *more* ASR passes, and on CPU a
+pass costs ~2.1s fixed regardless of length, so this costs about a second of
+lag. It is on by default anyway because it roughly triples how much of the
+transcript actually reaches the screen — see :class:`~rtt.config.VADConfig`.
 """
 
 from __future__ import annotations

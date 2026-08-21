@@ -201,23 +201,28 @@ class VADConfig:
     Uses the Silero model bundled with faster-whisper, so there is no extra
     dependency or download.
 
-    Off by default, because on CPU it currently loses. Cutting at pauses means
-    *more* ASR passes, and a pass costs roughly 2.1s fixed plus 0.09s per
-    second of audio on a 20-core CPU with Whisper ``base`` — Whisper pads every
-    chunk to a fixed 30s mel window, so the fixed part dominates. Measured
-    back-to-back over 52.9s of Arabic (scripts/bench_live_latency.py):
+    On by default, for accuracy rather than speed. It does cost latency:
+    cutting at pauses means *more* ASR passes, and a pass costs roughly 2.1s
+    fixed plus 0.09s per second of audio on a 20-core CPU with Whisper ``base``
+    (Whisper pads every chunk to a fixed 30s mel window, so the fixed part
+    dominates and pass count sets the bill).
 
-        VAD off:  11 passes, 28.7s ASR, median lag 4.25s
-        VAD on:   14 passes, 35.9s ASR, median lag 4.67s
+    It buys far more than it costs. Without it, a segment boundary lands
+    mid-utterance, consecutive passes disagree there, and
+    :func:`~rtt.text.reconcile_provisional` can only ever commit the leading
+    run they agree on — so most of the transcript is replaced rather than
+    committed and never reaches the screen. Measured over 52.9s of Arabic
+    containing 77 words (scripts/bench_live_latency.py, two runs each):
 
-    The extra passes cost more latency than cutting at pauses saves, so this
-    only becomes worthwhile once a pass is cheaper than the pauses it exploits
-    — on a GPU, or with a smaller live model. Transcript quality is visibly
-    better with it on (segments break at utterance boundaries instead of
-    mid-word), so it is worth revisiting there. Enable with ``RTT_LIVE_VAD=1``.
+        VAD off:  median lag 2.8-3.4s, 12-14 words shown, WER 0.88-0.95
+        VAD on:   median lag 3.9-4.2s, 34-51 words shown, WER 0.56-0.79
+
+    Roughly three times the content for about a second of lag. Showing 15% of
+    what was said is not a usable translation at any latency, which is why this
+    is on despite being the slower option. Disable with ``RTT_LIVE_VAD=0``.
     """
 
-    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", False))
+    enabled: bool = field(default_factory=lambda: _env_bool("LIVE_VAD", True))
     threshold: float = field(default_factory=lambda: float(_env("VAD_THRESHOLD", "0.5")))
     #: Silence after speech that closes an utterance. Too low and a mid-sentence
     #: breath splits the text; too high and the pause-to-text win shrinks.
