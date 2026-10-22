@@ -1,417 +1,194 @@
 # Real-Time Arabic → English Speech Translation
 
-Working toward a **real-time simultaneous interpreter**: Arabic speech in, English text and speech out, with speculative on-screen predictions and calibrated commitment before anything reaches the listener's ears.
-
-**Organizing principle: draft-and-verify everywhere.** A fast model drafts, a better-informed model verifies, and only verified content crosses into output the user trusts. Speculate everywhere; verify before the ear. This applies to ASR (fast transducer drafts, Whisper verifies), translation (incomplete source drafts, more-complete source verifies), and speech (audio synthesized speculatively, playback gated on commitment).
-
-What runs in this repo today is an earlier **cascade prototype** (Whisper → Marian/NLLB → optional TTS) with live incremental updates and a production Next.js UI. The architecture below is the **target system** the codebase is being shaped toward. Cloud APIs and network-backed models are acceptable when they improve latency or quality.
-
----
-
-## Target architecture
-
-**Verdict on cascade vs end-to-end: hybrid, decisively.** The cascade is the quality spine — Whisper's Arabic and a LoRA-tuned 14B's Arabic reasoning are each far better than anything available in a released end-to-end Arabic→English model. But a direct speech-to-text-translation model runs *alongside* it as an independent channel, because it does not share the cascade's ASR errors — and two architecturally independent systems agreeing is a far stronger safety signal than one system agreeing with itself.
-
-```
- Headset mic (close-talk, cardioid) ─► DeepFilterNet denoise ─► Silero VAD
-                                                │
-                          ┌─────────────────────┴────────────────────┐
-                          │                                          │
-                 ═══ DRAFT LANE (fast) ═══              ═══ VERIFY LANE (accurate) ═══
-                          │                                          │
-              Streaming ASR drafter                        Whisper large-v3
-              (whisper-turbo, 240 ms hop)                  (900 ms hop, CTranslate2)
-                          │                                          │
-                 provisional Arabic ─────► ARABIC STATE ◄──── verified Arabic
-                                                │
-                                  ┌─────────────┴──────────────┐
-                                  │                            │
-                     ARABIC STRUCTURAL GUARDS        SeamlessStreaming ar→en
-                     (VSO gap, iḍāfa, numerals,      (independent 2nd opinion,
-                      TAM particles, proclitics)      no shared ASR errors)
-                                  │                            │
-                                  ▼                            │
-        ┌──────────────────────────────────────────────┐       │
-        │  BRANCHED TRANSLATOR  (single batched call)  │       │
-        │  Qwen3-14B FP8 + SI-LoRA + EAGLE-3 spec-dec  │       │
-        │  shared KV prefix across all branches:       │       │
-        │    • 1 branch on observed Arabic only        │       │
-        │    • K=8 branches on observed + sampled        │       │
-        │      Arabic futures (0.5B Arabic drafter)    │       │
-        │  all branches PREFILLED with committed EN    │       │
-        └──────────────────────────────────────────────┘       │
-                                  │                            │
-                                  ▼                            │
-              ┌────────────────────────────────────────────────┘
-              ▼
-   ┌─────────────────────────────────────────────────────┐
-   │  COMMIT RISK MODEL  (gradient-boosted, <1 ms)       │
-   │  features: branch agreement depth, target-branch    │
-   │  divergence, guard state, temporal survival, ASR    │
-   │  confidence, Seamless agreement, current lag        │
-   │  output: P(this English prefix survives to the end) │
-   └─────────────────────────────────────────────────────┘
-              │                                    │
-      P < θ ──┴─► WAIT                   P ≥ θ ────┴─► COMMIT (immutable)
-              │                                    │
-              ▼                                    ▼
-     GREY SPECULATIVE TEXT              BLACK COMMITTED TEXT
-     (screen only, never spoken)                   │
-              │                                    │
-              ▼                                    ▼
-     SPECULATIVE TTS (synthesized       ┌──► matches spec buffer? play instantly
-     into a shadow buffer, muted) ──────┤
-                                        └──► mismatch? synthesize fresh (~90 ms)
-                                                     │
-                                                     ▼
-                                  JITTER BUFFER (600 ms target occupancy)
-                                  rate control 0.95×–1.15×, pauses only
-                                  at clause boundaries
-                                                     │
-                                                     ▼
-                        Streaming TTS in the SPEAKER'S CLONED VOICE
-                        (CosyVoice2-0.5B, persistent session, prosody carried
-                         across chunks) ──────► English audio out
-```
-
-Two structural properties:
-
-- **No sentence segmentation on the committed path.** Segmentation exists only to chunk text for TTS and trim context — both non-critical. Nothing waits for a sentence boundary (the failure mode on garden-path speech like “I think we should… probably… cancel the meeting”).
-- **Grey lane and black lane have different latencies by design.** The eye gets text at ~600 ms; the ear gets audio at ~2.2 s. That gap is intentional — text can be retracted; audio cannot.
-
-### Why not a single sampled future?
-
-Asking “what is the next Arabic phrase?” is the wrong question. The question that matters is: **does any plausible continuation change the English I am about to say?** That is a quantifier over futures; one sampled continuation is a point estimate least informative when the future is most uncertain.
-
-The fix is not to delete anticipation. It is to **marginalize over futures**, add a second orthogonal uncertainty axis anticipation alone cannot see, and **calibrate against ground truth the system harvests from itself** (retrospective labels on prefixes considered vs prefixes that actually survived).
-
----
-
-## Anticipation mechanism
-
-Replace one sampled future with a **calibrated marginal over futures, measured on two orthogonal axes, then learned rather than hand-tuned.**
-
-### Axis 1 — Future-marginal invariance
-
-A 0.5B Arabic causal LM samples K=8 short continuations (~8 tokens each) in one batched call (~10 ms). The translator runs 9 branches — observed-only plus eight futures — in a **single batched call with a fully shared KV prefix**. With prefix caching and continuous batching, K=8 costs barely more than K=1 (~60–100 ms on an H100). The commit candidate is the longest English prefix appearing in at least 7 of 9 branches; **agreement depth** is a continuous confidence score, not a binary flag.
-
-### Axis 2 — Target-space divergence
-
-Sampling futures cannot detect uncertainty about *how to render* what was already heard. The observed-only branch also runs with a small beam; measure where top hypotheses diverge. Future-agreement and target-agreement fail in different situations — a prefix must clear both.
-
-### Axis 3 — Structural invariance (Arabic guards)
-
-Sampling-based agreement has a blind spot: **correlated errors**, where every branch is confidently wrong the same way. Arabic produces these reliably. After hearing only `قفز`, all nine branches may commit “jumped” — unanimous and wrong, because VSO order means the English subject slot cannot be filled yet.
-
-Guards catch this class: verb with no subject yet, bare noun that may head an *iḍāfa*, noun awaiting postnominal adjectives, partially-heard numerals (`واحد وعشرون` — emitting “one” first is unrecoverable), pre-verbal TAM particles (`كان`, `لم`, `قد`, `سوف`), dangling proclitics. Conversely, pro-drop is free latency: `ذهبتُ` carries person and number, so “I went” is committable once the verb is stable.
-
-### Learned, calibrated risk head
-
-Run the pipeline offline over hours of Arabic speech. For every prefix *considered* for commit, retrospectively label whether it **survived** once the full utterance is decoded — free, exact, self-supervised data. Train a small gradient-boosted classifier on branch agreement depth, target divergence, guard state, ASR posterior, Seamless agreement, current lag, tokens since last commit → P(survives). Inference is under a millisecond.
-
-Commitment becomes a **calibrated risk estimate with a tunable operating point** θ (e.g. “we commit at 99% predicted survival”), not a hand-tuned heuristic. The temporal verifier is both the runtime safety net and the label generator that trains the prospective predictor.
-
----
-
-## Commitment algorithm
-
-Per tick (240 ms draft lane, 900 ms verify lane):
-
-1. **Update Arabic state.** Drafter tokens feed only the speculative path. Promote to *verified* when Whisper confirms, or drafter and verifier agree across two consecutive frames. Never treat a partial Arabic word as verified — `كتاب` vs `كتابه` differ by one suffix and by “a book” vs “his book.”
-2. **Guard check.** If the verified tail sits in a hazardous construction, return WAIT and skip the LLM call.
-3. **Branched translation.** One batched call, nine branches, all prefilled with committed English so the model cannot rewrite spoken text.
-4. **Score.** Agreement depth, target divergence, temporal survival vs previous tick, Seamless agreement → risk model → P(survives) as a function of prefix length.
-5. **Commit.** Longest prefix with P(survives) ≥ θ, truncated to a word boundary. Default θ = 0.97.
-6. **Lag governor.** Track lag from Whisper word timestamps. Above 3.0 s, decay θ (0.97 → 0.90 → 0.80); at 3.5 s hard ceiling, force-commit to nearest guard-safe boundary. Below 1.2 s lag, raise θ. Without this, fast speakers make lag grow without bound.
-7. **Emit.** Committed words go black and enter the TTS queue. Best speculative branch beyond the commit point renders grey, damped to avoid visual flicker.
-
-In one sentence: **commit the longest English prefix that a calibrated model predicts will survive with ≥97% probability, given eight sampled futures, competing translations of the present, the last 240 ms of audio, and Arabic constructions whose heads have not yet arrived — unless lag exceeds 3 s, in which case lower the bar rather than fall further behind.**
-
----
-
-## Speculative pipeline
-
-The retraction boundary is the ear; everything upstream should be as aggressive as hardware allows.
-
-**Fully speculative, freely discarded:** provisional ASR from the draft lane; eight sampled Arabic futures; all nine translation branches; grey on-screen text; **synthesized audio** in a muted shadow buffer. On commit, playback is instant; on rejection, audio is discarded silently.
-
-**Must be verified before the ear:** text entering the commit queue (guards + risk threshold). Once unmuted, waveform is final — no rollback, no correction.
-
-**Not speculative:** committed English is prefilled into every branch — immutability by construction.
-
-**Speculative decoding** (EAGLE-3 inside the translator) is a *computational* optimization. **Linguistic speculation** (branches over futures) is a *semantic* mechanism. They stack but solve different problems.
-
-Speculative TTS should run **locally** so session state can be snapshotted and rolled back — a constraint on deployment, not just quality.
-
----
-
-## Model and technology choices (target)
-
-| Layer | Choice | Notes |
-| --- | --- | --- |
-| Front end | Cardioid headset, DeepFilterNet3, Silero VAD | Ambient noise destroys ASR before architecture can save it |
-| ASR draft | `whisper-large-v3-turbo`, 240 ms hop, greedy | faster-whisper |
-| ASR verify | `whisper-large-v3`, 900 ms hop, beam 2, word timestamps | Lag governor needs timestamps |
-| Arabic futures | 0.5B causal LM, K=8 continuations | ~10 ms batched |
-| Translation | Qwen3-14B FP8, vLLM, SI-LoRA, EAGLE-3 | LoRA on synthetic simultaneous-interp (prefix→prefix) data |
-| Second opinion | SeamlessStreaming ar→en | Error-decorrelation sensor, not primary translator |
-| TTS | CosyVoice2-0.5B streaming, cloned voice, persistent session | Kokoro fallback |
-| Inference | 2× H100 80GB | GPU A: vLLM only. GPU B: Whispers, Seamless, TTS |
-
-**Context:** pinned session memo (topic, entities, terminology glossary) refreshed every 30 s; last ~60 s of committed text appended. Preload glossary with domain proper nouns, company names, and Arabic honorifics.
-
-Optional: NeMo FastConformer-RNNT on MGB-2 as drafter; Qwen3-32B FP8 as quality toggle if VRAM allows.
-
----
-
-## Latency budget (target)
-
-Three quantities:
-
-- **Linguistic latency** — how much future Arabic the policy needs before safe to speak.
-- **Computational latency** — wall-clock after required audio exists.
-- **Perceived audio latency** — Arabic spoken to English audible, including jitter buffer.
-
-| Milestone | Target | Composition |
-| --- | --- | --- |
-| First grey text | 550–700 ms | 240 ms hop + ASR + MT + render |
-| First committed black text | 1.3–1.8 s | ~0.9 s linguistic + ~0.4 s compute |
-| First spoken English | 2.0–2.5 s | commit + speculative-hit TTS + buffer |
-| Steady-state ear-to-ear | 2.0–2.8 s | ~1.0 s linguistic, ~0.7 s compute, ~0.5 s buffer |
-| Worst case (guard-heavy) | 3.5 s hard cap | lag governor |
-
-Human simultaneous interpreters work at a 2–4 s ear-voice span; **the eye is served roughly four times faster than the ear** — different risk budgets because text can be retracted and audio cannot.
-
----
-
-## Why this beats a simple cascade
-
-- Anticipation: nine-branch marginal + **calibrated self-supervised risk model** instead of one sampled future and hand-tuned heuristics.
-- Second axis: **target-space divergence** for translation ambiguity futures cannot see.
-- Guards: catch **correlated Arabic errors** no amount of sampling fixes.
-- Latency: 240 ms draft hop, EAGLE-3, speculative pre-synthesis, variable-length risk-based acceptance.
-- Robustness: **error decorrelation** via independent Seamless channel vs single-ASR agreement.
-- Output: cloned voice with prosody across chunks vs chunked robotic TTS.
-
----
-
-## What this repo implements today
-
-| Piece | Status |
-| --- | --- |
-| Cascade ASR → MT → TTS | ✅ Whisper + Marian/NLLB |
-| Live incremental mic path | ✅ fast live + accurate final on stop |
-| Production UI (speculative text UX) | ✅ Next.js; black = verified, grey = provisional |
-| Verified vs provisional Arabic (live lane) | ✅ `reconcile_provisional()` in `text.py` + session split |
-| Production UI wired to verified/provisional | ✅ black = verified, grey = provisional, live WebSocket |
-| Draft-and-verify dual ASR lanes (parallel) | 🔲 still single fast lane + final on stop |
-| Branched translator + agreement scoring | ✅ batched branches + agreement depth (live path partial) |
-| Arabic structural guards | ✅ lexicon always; VSO/iḍāfa via optional `requirements-guards.txt` |
-| Seamless second opinion | ✅ opt-in logging channel (`RTT_SECOND_OPINION_ENABLED=1`) |
-| Retrospective label harvesting | ✅ offline `scripts/harvest_labels.py` |
-| Speculative TTS + jitter buffer | 🔲 |
-| Cloned-voice streaming TTS | 🔲 target (CosyVoice2) |
-| Production packaging (Docker + HTTPS) | ✅ Compose + Caddy reverse proxy |
-| CI | ✅ pytest + production-ui build on GitHub Actions |
-| Session UX (reconnect, finalize, selectors) | ✅ WS reconnect, progress, empty/error, model selectors |
-| Ops (logs, metrics, readiness) | ✅ JSON logs, `/metrics`, `/ready` gate |
-
----
-
 ## How to run
 
-The interpreter is the **Next.js production UI** plus the WebSocket API. Gradio is not the product.
-
-### Start the bot (every time)
+**Windows / PowerShell — from the repository folder:**
 
 ```powershell
-cd C:\Users\xsaad\Documents\real-time-translation
-.\.venv\Scripts\Activate.ps1
-python --version          # must show 3.12.x
-python run_production.py
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_demo.ps1
 ```
 
-Wait until you see:
+Open the **UI address printed by the launcher**, normally **http://127.0.0.1:3000**. Keep the window open, wait for models to become ready, select **Live**, press **Start**, and allow microphone access. Press **Stop** to finalize. Stop services with **Ctrl+C** in the launcher window.
+
+**First time on a new machine:** install Python **3.12** and Node.js **22 or newer** with npm, then run:
+
+```powershell
+git clone https://github.com/xsaadahmed/real-time-translation.git
+cd real-time-translation
+py -3.12 -m venv .venv
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_demo.ps1 -Prepare
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_demo.ps1
+```
+
+Preparation installs dependencies, downloads Whisper Small and Marian, and builds the Next.js interface. It needs internet and sufficient disk space. Repeat `-Prepare` after pulling application changes to rebuild the interface. Daily launch uses the prepared build without reinstalling packages. Missing model weights can still trigger downloads; prepare before going offline.
+
+**Emergency scripted preview:**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_demo.ps1 -FallbackOnly
+```
+
+This starts explicitly labeled simulated output without loading speech models. It still requires installed dependencies and the prepared frontend. It does **not** recognize microphone speech.
+
+## What runs today
+
+A local Arabic speech recognition and English **text** translation demo. Next.js captures microphone audio; FastAPI transports audio and results over WebSockets. Actual recognition uses faster-whisper, followed by Marian Arabic-to-English translation.
+
+| Mode | Input | Output |
+| --- | --- | --- |
+| **Live** | Browser microphone | Actual model-generated Arabic transcription and English translation |
+| **Simulated** | Prepared script, no microphone | Predictable, visibly labeled interface demonstration |
+
+Live text is a **revisable draft** until Stop. Earlier words and translations can change as more audio arrives. This demo does not provide simultaneous English speech output.
+
+## Giving a live demonstration
+
+1. Use a close-talk headset in a quiet location. Check the selected microphone in Windows and the browser.
+2. Select **Live**, wait for readiness, and choose a speech model before starting.
+3. Press **Start** and speak Arabic in short, natural sentences. Allow several seconds for the first draft.
+4. Pause occasionally to let decoding catch up. Earlier wording can correct itself without pressing Stop.
+5. Press **Stop** for the complete-recording final pass. Start a new session for the next example.
+
+Recordings finalize automatically at **30 seconds**. Only one live session is admitted at a time, including outstanding inference work. A disconnected session is interrupted; reconnecting does not restore its audio context.
+
+See [DEMO_RUNBOOK.md](DEMO_RUNBOOK.md) for presenter phrases and recovery steps.
+
+## Speech model dropdown
+
+The compact **Speech model** dropdown changes the actual ASR used for both live drafts and finalization. Marian remains the translator.
+
+| Choice | Practical use |
+| --- | --- |
+| Tiny | Lowest compute cost; Arabic recognition may be insufficient |
+| Base | Lightweight alternative; validate accuracy before presenting |
+| **Small** | Default and recommended starting point on the tested CPU laptop |
+| Medium | More compute and memory; potentially better recognition with slower updates |
+| Large turbo | Larger option; not hardware-validated here |
+| Large v3 | Larger option; not hardware-validated here |
+
+Finish the current session before switching. The interface displays loading status and disables recording during a change. Previous ASR weights are released before loading the new model; the translator stays loaded. Failure attempts to restore the previous cached ASR.
+
+An uncached model downloads on first selection. Load intended exhibition models beforehand. A restart returns to **Small**. Larger models are not guaranteed to improve your specific speech.
+
+The exhibition profile uses **CPU int8 ASR**, four CPU threads, one ASR worker, and beam size 3. The dropdown changes size, not device or compute settings. AMD integrated graphics are not used by this profile. On a 16 GB laptop, reduce background memory use before trying larger models.
+
+## Live architecture
 
 ```text
-API ready on http://127.0.0.1:8765
-UI:   http://127.0.0.1:3000
+Browser microphone
+    → WebSocket PCM audio
+    → bounded in-memory recording
+    → Whisper Arabic transcription of the complete recording so far
+    → Marian translation of the complete recognized Arabic
+    → replaceable Arabic and English drafts
+    → final full-context pass on Stop
 ```
 
-Then open **http://127.0.0.1:3000** in your browser.
+The production path is in `src/rtt/live/context_session.py` and `src/rtt/live/runtime.py`.
 
-- First start can take **1–3 minutes** while Whisper + translation models load. You will see `still loading models…` — do not Ctrl+C during that.
-- Later starts are faster once models are cached.
-- Stop both servers with **Ctrl+C**.
+- Initial decoding normally starts after approximately four seconds of audio, plus processing time. A short phrase followed by quiet can trigger sooner.
+- Updates catch up using the latest context rather than queuing stale audio cuts.
+- Whole-context drafts replace previous text instead of permanently stitching uncertain short fragments.
+- One quiet-tail recheck is retained, then repeated silence can reuse the draft without repeated inference. This is an energy heuristic, not noise cancellation.
+- Live and Stop share one loaded ASR/translation pipeline. Speech synthesis and research channels are excluded from this path.
 
-**Boss / target-UX demo (no models):** `python run_demo.py` — same Next.js UI, hardcoded script that shows grey speculative text then black commits growing in real time. Instant ready; not the live cascade.
+This favors coherent short demonstrations. Processing time grows with recording length; continuous low-latency interpretation of long speeches is outside the current scope.
 
-macOS / Linux:
+## Executed checks and limitations
 
-```bash
-cd /path/to/real-time-translation
-source .venv/bin/activate
-python run_production.py
-# open http://127.0.0.1:3000
-```
+The inspected laptop has a Ryzen 7 8840HS, 16 GB RAM, and AMD integrated graphics. Tests used local models, without paid APIs.
 
-### First-time setup (once)
-
-Use **Python 3.12.x only** (same as Docker and CI). `.python-version` pins `3.12`. Python 3.13+ / 3.14 will fail — the launcher exits early with an install hint.
-
-**Windows:**
-
-```powershell
-# Install 3.12 if needed: winget install Python.Python.3.12
-cd C:\Users\xsaad\Documents\real-time-translation
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python --version   # must print 3.12.x
-pip install -r requirements.txt
-python scripts/download_models.py
-```
-
-**macOS / Linux:**
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/download_models.py
-```
-
-Node.js is required for the local UI (`npm` must be on PATH).
-
-Then start:
-
-```powershell
-python run_production.py
-```
-
-### Tests
-
-```powershell
-pytest tests/
-```
-
-### Optional: Arabic morphology guards (camel-tools)
-
-Lexicon guards (TAM, numerals, proclitics) work with the core install.
-
-**VSO** and **iḍāfa** guards need an extra package and a ~40MB dictionary DB. Without them the live path still runs; those two guards simply no-op.
-
-```powershell
-pip install -r requirements-guards.txt
-python scripts/download_models.py --camel-data-only
-```
-
-Docker and CI install this step automatically.
-
----
-
-## Production deploy (Docker)
-
-Runs the API, Next.js UI, and a **Caddy** reverse proxy that terminates HTTPS and routes **`wss://your-host/ws`** to the API on the same origin (no split-origin CORS).
-
-### 1. Configure
-
-```bash
-cp .env.example .env
-# Set your real domain for Let's Encrypt:
-# RTT_PUBLIC_HOST=translate.example.com
-```
-
-All pipeline tuning uses existing `RTT_*` variables (see `.env.example`).
-
-### 2. Start (HTTPS via Caddy)
-
-```bash
-docker compose up -d --build
-```
-
-| URL | Purpose |
+| Check | Observed result |
 | --- | --- |
-| `https://<RTT_PUBLIC_HOST>/` | Production UI |
-| `wss://<RTT_PUBLIC_HOST>/ws` | Live interpreter WebSocket (auto-used by UI) |
-| `https://<RTT_PUBLIC_HOST>/health` | Liveness (process up) |
-| `https://<RTT_PUBLIC_HOST>/ready` | Readiness (models loaded) — Compose waits on this |
-| `https://<RTT_PUBLIC_HOST>/metrics` | Session / finalize latency counters |
-| `https://<RTT_PUBLIC_HOST>/config` | Live/final model config (GET/PUT) |
-| `http://localhost:8080/` | Plain HTTP (no TLS), for quick local checks |
+| Python regression suite | **80 passed, 4 skipped**; optional morphology checks skipped |
+| Next.js production build | Passed with TypeScript checking enabled |
+| Small, three clean MSA recordings / 53 reference words | Normalized live WER improved from 64.2% to 11.3% in the before/after architecture/configuration comparison |
+| Small, paced clean-audio WebSocket replay | About **7.2 seconds** to first update on one sample |
+| Medium, one clean MSA sample | **0 normalized word errors**, about **11.9 seconds** to first update |
+| Actual model switching | Medium loaded, Small restored; active-session changes rejected |
+| Empty sessions and bounds | 20 empty start/stop cycles and the 30-second cap checked |
+| Synthetic noisy audio | Substantial degradation remained; one diagnostic measured 50% WER |
 
-**First boot** downloads ASR/MT models into the `rtt-models` volume and can take several minutes. Model cache persists across restarts.
+These are small development checks, not a general benchmark. The three-sample accuracy comparison used synchronous prefix processing, not real-time latency measurement. Word error rate measures Arabic transcription, not English translation quality. Large/turbo dispatch is unit-tested with injected engines; those weights have not been loaded or benchmarked here.
 
-For **local HTTPS** with `RTT_PUBLIC_HOST=localhost`, Caddy uses an internal CA — trust it in your browser or use port `8080` instead.
+Gulf dialect, exhibition noise, browser microphone denial/disconnection, prolonged booth operation, and offline clean-machine recovery remain incompletely qualified. No ten-minute resource soak or Docker acceptance test is claimed. [DEMO_VALIDATION.md](DEMO_VALIDATION.md) records dated evidence and remaining risks; later entries supersede the original audit baseline.
 
-### 3. Dev-style Docker (direct ports, no proxy)
+## Automatic validation
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
-```
-
-- UI: `http://localhost:3000`
-- API / WS: `http://localhost:8765` / `ws://localhost:8765/ws`
-
-Set `RTT_PUBLIC_WS_URL=ws://localhost:8765/ws` in `.env` if the UI cannot reach the API on the same host.
-
-### Environment reference
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `RTT_PUBLIC_HOST` | `localhost` | Domain Caddy serves (TLS) |
-| `RTT_PUBLIC_URL` | — | Optional public site URL (health metadata) |
-| `RTT_PUBLIC_WS_URL` | — | Override WebSocket URL written to UI runtime config |
-| `RTT_CORS_ORIGINS` | localhost dev ports | Required only for split-origin deploys |
-| `RTT_SKIP_MODEL_WARMUP` | `0` | Skip model load at API container start |
-| `RTT_API_HOST` / `RTT_API_PORT` | `0.0.0.0` / `8765` | API bind address inside container |
-
-### Live tuning
+No speaker playback or manual microphone operation is needed for the audio checks. The scripts download a few public MSA recordings once and reuse a scratch cache.
 
 ```powershell
-$env:RTT_LIVE_ASR_MODEL="tiny"
-$env:RTT_LIVE_MT_BACKEND="marian"
-$env:RTT_ASR_MODEL="large-v3-turbo"
-$env:RTT_NLLB_SOURCE_LANG="apc_Arab"
+# Unit tests
+.\.venv\Scripts\python.exe -m pytest tests/
+
+# Actual model accuracy checks
+.\.venv\Scripts\python.exe scripts/validate_live_accuracy.py --work-dir work/audio-check --report outputs/audio-accuracy.json
+
+# With the real demo running: paced WebSocket audio and session checks
+.\.venv\Scripts\python.exe scripts/validate_live_socket.py --work-dir work/audio-check --report outputs/socket-check.json
 ```
 
----
+Rebuild after frontend changes:
 
-## Project layout
-
-```
-run_production.py         Interpreter launcher (Next.js + API) — use this
-run_demo.py               Same UI + hardcoded target UX (no models; boss demo)
-run_ui.py                 Debug-only Gradio scratch UI (not the product)
-docker-compose.yml        Production stack (api + ui + Caddy HTTPS)
-docker/                   Dockerfiles, Caddyfile, entrypoints
-production-ui/            Interpreter interface (grey/black text UX)
-src/rtt/
-  pipeline.py             Current cascade orchestrator
-  live/session.py         Incremental live sessions (step toward draft lane)
-  api/production_server.py WebSocket bridge
-  api/settings.py         Production API env (CORS, public URLs)
-  asr/  mt/  tts/         Pluggable backends
-  text.py                 Arabic chunking; guard rules land here
-scripts/                  Model download, smoke tests
-requirements.txt          Core deps (Python 3.12)
-requirements-guards.txt   Optional camel-tools for VSO/iḍāfa guards
-.env.example              Production / Docker environment template
-.python-version           Pins CPython 3.12 for pyenv / asdf
+```powershell
+cd production-ui
+npm ci
+npm run build
+cd ..
 ```
 
----
+Test audio and generated reports are excluded from Git. Recordings come from the Arabic Speech Corpus mirror `tunis-ai/arabic_speech_corpus`, attributed to Nawar Halabi under CC-BY-4.0. They are not bundled with the application. These read-MSA samples do not qualify Gulf speech or booth noise.
 
-## Extension points (mapped to target arch)
+## Troubleshooting
 
-- `asr.base.ASREngine` — draft lane (`transcribe_chunk`) + verify lane (full re-decode).
-- `live/session.py` — verified vs provisional Arabic/English; parallel verify lane still TODO.
-- `text.py` — structural guards (VSO, *iḍāfa*, numerals, TAM, proclitics).
-- `mt.base.Translator` — branched batched translation with shared prefix + committed EN prefill.
-- New `commit/` module — risk model, lag governor, commit policy.
-- `tts/` — speculative shadow buffer + jitter-buffered playback.
+| Symptom | Action |
+| --- | --- |
+| Python version or venv error | Create the venv with `py -3.12 -m venv .venv`; avoid a different default Python |
+| Dependencies or frontend build missing | Run `launch_demo.ps1 -Prepare` with internet, then launch again |
+| Models still loading | Wait for readiness; first downloads/load take time. Avoid repeated restarts |
+| Microphone denied or silent | Allow microphone access for the printed localhost address; check browser input and Windows privacy settings |
+| Slow drafts | Use Small, short recordings, pauses, and fewer background CPU/RAM consumers |
+| Inaccurate drafts | Use a close-talk headset and reduce noise. Try Medium if its delay is acceptable |
+| New model fails | Wait for rollback, use the previous size, or restart to Small; inspect the launcher error |
+| Connection interrupted | Start a new session; interrupted audio is not resumed |
+| Live fails during the talk | Explicitly select Simulated, or restart with `-FallbackOnly`, and explain that it is scripted |
+| Default port occupied | Use the exact printed URL; defaults are UI 3000 and API 8765 |
 
----
+An unusual UI port may prevent model changes under the default Origin allowlist. Stop duplicate launchers and prefer default ports; custom origins require `RTT_CORS_ORIGINS` before startup.
 
-## Debug only (Gradio)
+After caching intended models, `HF_HUB_OFFLINE=1` can prevent network model lookups. Validate the prepared laptop offline before relying on it at the exhibition.
 
-`python run_ui.py` launches a leftover Gradio page at http://127.0.0.1:7860. Use it for pipeline debugging, not as the interpreter. The supported local entrypoint is `python run_production.py`.
+## Local operation and deployment scope
+
+The supported Windows launcher binds services to **127.0.0.1**. Model changes require a local client and an allowed browser Origin; overlapping live/model operations are rejected. These are not complete public authentication or abuse controls.
+
+Docker/Compose/Caddy configurations and a Gradio debug UI remain in the repository. They are not the accepted exhibition launch path; Docker has not been revalidated with these changes. Public exposure requires a separate security/deployment review. The Docker-oriented `.env.example` does not override every setting in the fixed exhibition profile: model selection is owned by `live/runtime.py` and the dropdown.
+
+## Licensing
+
+The active translator is **`Helsinki-NLP/opus-mt-ar-en`**, whose [model card lists Apache-2.0](https://huggingface.co/Helsinki-NLP/opus-mt-ar-en). Upstream Whisper publishes an [MIT license](https://github.com/openai/whisper/blob/main/LICENSE). Preserve applicable notices and review the exact converted weights and dependency terms used in your distribution.
+
+NLLB and optional research backends are not selected by this demo. Do not substitute noncommercial weights into a company exhibition without appropriate permission. This checkout has no repository-wide source LICENSE file; dependency/model licenses do not establish ownership or redistribution permission for this project's source.
+
+## Repository guide
+
+| Path | Purpose |
+| --- | --- |
+| `launch_demo.ps1` | Windows preparation, daily launch, simulated-only launch |
+| `run_production.py` | Local API and prepared Next.js UI launcher |
+| `run_demo.py` | Scripted-only server and UI launcher |
+| `production-ui/` | Arabic/English interface, microphone capture, model dropdown |
+| `src/rtt/api/production_server.py` | WebSocket API and runtime configuration |
+| `src/rtt/live/context_session.py` | Bounded full-context drafts and finalization |
+| `src/rtt/live/runtime.py` | Model ownership and safe switching |
+| `src/rtt/asr/`, `src/rtt/mt/` | Recognition and translation backends |
+| `scripts/validate_live_*.py` | Automatic real-audio checks |
+| `tests/` | Model, session, audio, and API tests |
+| [DEMO_RUNBOOK.md](DEMO_RUNBOOK.md) | Presenter instructions and recovery |
+| [DEMO_VALIDATION.md](DEMO_VALIDATION.md) | Executed checks and remaining risks |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Original prioritized audit and decisions |
+| [TERRA_HANDOFF.md](TERRA_HANDOFF.md) | Historical handoff; validation records subsequent progress |
+
+## Deliberately deferred
+
+Voice cloning, simultaneous English speech output, speculative speech synthesis, trained risk scoring, multi-model verification, a new Qwen translation stack, public hosting, and continuous multi-user interpretation are outside this demo. Experimental modules do not imply those capabilities are implemented in the supported interface.

@@ -45,8 +45,6 @@ require_supported_python()
 from run_production import (  # noqa: E402
     _api_alive,
     _api_ready,
-    _cleanup_stale_api,
-    _cleanup_stale_next_dev,
     _install_ui_deps,
     _is_port_in_use,
     _resolve_pm,
@@ -128,10 +126,6 @@ def main() -> int:
     print("  Real pipeline:  python run_production.py")
     print("=" * 60)
     print()
-
-    print("Cleaning up any leftover API workers from earlier runs…")
-    _cleanup_stale_api(args.api_port)
-    _cleanup_stale_next_dev()
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC)

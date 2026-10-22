@@ -73,11 +73,9 @@ require_supported_python()
 
 def _resolve_pm() -> tuple[str, list[str]]:
     """Return an executable path and base args for npm/pnpm (Windows-safe)."""
-    candidates = (
-        ["pnpm.cmd", "pnpm", "npm.cmd", "npm"]
-        if sys.platform == "win32"
-        else ["pnpm", "npm"]
-    )
+    # package-lock.json is the supported lockfile. Prefer npm so a globally
+    # installed pnpm cannot rewrite node_modules or block on pnpm policies.
+    candidates = (["npm.cmd", "npm", "pnpm.cmd", "pnpm"] if sys.platform == "win32" else ["npm", "pnpm"])
     for name in candidates:
         path = shutil.which(name)
         if path:
@@ -217,7 +215,7 @@ def _install_ui_deps(pm: str) -> None:
     if node_modules.exists():
         return
     print("Installing production UI dependencies (first run only)…")
-    _run_pm(pm, ["install"], cwd=UI)
+    _run_pm(pm, ["ci"] if Path(pm).name.lower().startswith("npm") else ["install"], cwd=UI)
 
 
 def _warmup_models() -> None:
@@ -328,7 +326,8 @@ def _start_ui(
     start_port: int,
     env: dict[str, str],
 ) -> tuple[subprocess.Popen, int]:
-    _cleanup_stale_next_dev()
+    if not (UI / ".next" / "BUILD_ID").is_file():
+        raise RuntimeError("Prepared UI build missing. Run npm ci and npm run build in production-ui once.")
 
     for port in range(start_port, start_port + MAX_PORT_ATTEMPTS):
         if _is_port_in_use(port):
@@ -337,7 +336,7 @@ def _start_ui(
 
         proc = _popen_pm(
             pm,
-            ["run", "dev", "--", "-H", HOST, "-p", str(port)],
+            ["run", "start", "--", "-H", HOST, "-p", str(port)],
             cwd=UI,
             env=env,
         )
@@ -358,7 +357,8 @@ def _start_ui(
             time.sleep(0.5)
 
         if proc.poll() is None:
-            return proc, port
+            proc.terminate()
+            raise RuntimeError(f"UI did not become healthy on port {port} within {int(UI_STARTUP_TIMEOUT_SEC)}s.")
 
     raise RuntimeError(
         f"Failed to start UI after checking ports {start_port}–"
@@ -401,9 +401,7 @@ def main() -> int:
     else:
         print("Models will load inside the API process (first run can take a few minutes).")
 
-    print("Cleaning up any leftover API workers from earlier runs…")
-    _cleanup_stale_api(args.api_port)
-    _cleanup_stale_next_dev()
+    print("Checking for available local ports…")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC)

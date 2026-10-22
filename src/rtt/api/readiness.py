@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Any
 
@@ -15,7 +14,7 @@ _lock = threading.Lock()
 
 LIVE_ASR_OPTIONS = ("tiny", "base", "small", "medium", "large-v3-turbo", "large-v3")
 FINAL_ASR_OPTIONS = ("tiny", "base", "small", "medium", "large-v3-turbo", "large-v3")
-MT_OPTIONS = ("marian", "nllb")
+MT_OPTIONS = ("marian",)
 # Product is Arabic → English; exposed for UI clarity / future expansion.
 SOURCE_LANG = "ar"
 TARGET_LANG = "en"
@@ -44,14 +43,16 @@ def mark_not_ready(error: str | None = None) -> None:
 
 
 def current_config() -> dict[str, Any]:
-    from ..config import detect_device
-    from ..ui.gradio_app import describe_runtime_config
+    from ..live.runtime import describe_runtime_config
 
     return {
         "ready": _ready,
+        "error": _ready_error,
         "source_lang": SOURCE_LANG,
         "target_lang": TARGET_LANG,
-        "device": detect_device(),
+        "modes": ["live", "simulated"],
+        "exhibition_mode": True,
+        "device": "cpu",
         "options": {
             "live_asr": list(LIVE_ASR_OPTIONS),
             "final_asr": list(FINAL_ASR_OPTIONS),
@@ -67,37 +68,14 @@ def apply_config(
     final_asr: str | None = None,
     live_mt: str | None = None,
 ) -> dict[str, Any]:
-    """Update model env prefs and rebuild the live store when idle."""
-    from ..ui.gradio_app import active_session_count, reset_store
-
-    if live_asr is not None:
-        if live_asr not in LIVE_ASR_OPTIONS:
-            raise ValueError(f"Invalid live_asr: {live_asr}")
-        os.environ["RTT_LIVE_ASR_MODEL"] = live_asr
-    if final_asr is not None:
-        if final_asr not in FINAL_ASR_OPTIONS:
-            raise ValueError(f"Invalid final_asr: {final_asr}")
-        os.environ["RTT_ASR_MODEL"] = final_asr
-    if live_mt is not None:
-        if live_mt not in MT_OPTIONS:
-            raise ValueError(f"Invalid live_mt: {live_mt}")
-        os.environ["RTT_LIVE_MT_BACKEND"] = live_mt
-
-    if active_session_count() > 0:
-        raise RuntimeError("Cannot change models while a session is active.")
-
-    mark_not_ready("Reloading models…")
-    try:
-        reset_store()
-        # Force reload via get_store side effect
-        from ..ui.gradio_app import get_store
-
-        get_store()
-        mark_ready()
-    except Exception as exc:
-        mark_not_ready(str(exc))
-        raise
-
+    """Change only the speech model; live and final use the same selected size."""
+    from ..live.runtime import change_model, describe_runtime_config
+    selected = live_asr or final_asr or describe_runtime_config()["live_asr"]
+    if live_asr and final_asr and live_asr != final_asr:
+        raise ValueError("Live and final must use the same speech model.")
+    if live_mt is not None and live_mt != "marian":
+        raise ValueError("The translation model must remain Marian.")
+    change_model(selected, mark_not_ready, mark_ready, mark_not_ready)
     return current_config()
 
 
@@ -105,7 +83,7 @@ def warmup_models() -> None:
     """Load live pipeline (and mark ready). Called from API lifespan."""
     mark_not_ready("Loading models…")
     try:
-        from ..ui.gradio_app import get_store
+        from ..live.runtime import get_store
 
         get_store()
         mark_ready()

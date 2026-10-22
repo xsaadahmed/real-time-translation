@@ -10,11 +10,6 @@ from .base import ASREngine, Transcript, TranscriptSegment
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ARABIC_PROMPT = (
-    "مرحبا، أنا من لبنان. نتحدث باللغة العربية عن لبنان واللغة والهوية."
-)
-
-
 class FasterWhisperASR(ASREngine):
     name = "faster-whisper"
 
@@ -49,7 +44,9 @@ class FasterWhisperASR(ASREngine):
         )
 
     def _initial_prompt(self) -> str | None:
-        prompt = (self.config.initial_prompt or _DEFAULT_ARABIC_PROMPT).strip()
+        # A fixed topical prompt caused the recogniser to hallucinate that topic
+        # over digital silence.  Exhibition sessions must be neutral by default.
+        prompt = self.config.initial_prompt.strip()
         return prompt or None
 
     def transcribe(self, audio: AudioArray, sample_rate: int) -> Transcript:

@@ -13,12 +13,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ..ui.gradio_app import get_store
+from ..live.runtime import get_store, create_session
 from .logging_config import configure_logging
 from .metrics import metrics
 from .readiness import (
@@ -37,6 +37,8 @@ _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rtt-api")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _executor
+    _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rtt-api")
     configure_logging(
         json_logs=os.environ.get("RTT_JSON_LOGS", "1").strip().lower()
         in {"1", "true", "yes", "on"},
@@ -47,9 +49,13 @@ async def lifespan(_app: FastAPI):
     # never came up (models take far longer than the bind timeout).
     from .readiness import mark_not_ready
 
-    mark_not_ready("Loading models…")
-    loop = asyncio.get_running_loop()
-    warm_future = loop.run_in_executor(_executor, warmup_models)
+    if os.environ.get("RTT_FALLBACK_ONLY", "").lower() in {"1", "true", "yes"}:
+        mark_not_ready("Live mode disabled; simulated preview is available.")
+        warm_future = None
+    else:
+        mark_not_ready("Loading models…")
+        loop = asyncio.get_running_loop()
+        warm_future = loop.run_in_executor(_executor, warmup_models)
     logger.info(
         "API listening; model warmup running in background",
         extra={"event": "api_start"},
@@ -57,7 +63,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
-        if not warm_future.done():
+        if warm_future is not None and not warm_future.done():
             warm_future.cancel()
         logger.info("API shutting down", extra={"event": "api_shutdown"})
         _executor.shutdown(wait=False, cancel_futures=True)
@@ -66,6 +72,8 @@ async def lifespan(_app: FastAPI):
 #: How often the websocket checks session state for new text to push. This sits
 #: on top of the live pipeline's own latency, so keep it well under it.
 WS_POLL_SEC = float(os.environ.get("RTT_WS_POLL_SEC", "0.1"))
+MAX_FRAME_BYTES = int(os.environ.get("RTT_MAX_FRAME_BYTES", str(256 * 1024)))
+ALLOWED_RATES = {8_000, 16_000, 22_050, 24_000, 44_100, 48_000, 96_000}
 
 app = FastAPI(title="RTT Production API", version="1.0.0", lifespan=lifespan)
 
@@ -79,6 +87,7 @@ app.add_middleware(
 
 
 class ConfigUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
     live_asr: str | None = Field(default=None)
     final_asr: str | None = Field(default=None)
     live_mt: str | None = Field(default=None)
@@ -100,6 +109,8 @@ def _state_payload(
         "english_provisional": state.english_provisional,
         "status": state.status_message,
         "duration_sec": state.duration_sec(),
+        "decoded_duration_sec": getattr(state, "decoded_duration_sec", 0.0),
+        "decode_seconds": getattr(state, "decode_seconds", 0.0),
         "finalized": finalized,
         "phase": phase
         or ("final" if finalized else ("listening" if state.is_active else "idle")),
@@ -140,6 +151,7 @@ async def _poll_updates(
     last_en_verified = ""
     last_en_provisional = ""
     last_status = ""
+    last_processed_samples = -1
 
     while not stop_event.is_set():
         state = store.get(session_id)
@@ -152,6 +164,7 @@ async def _poll_updates(
             or state.english_verified != last_en_verified
             or state.english_provisional != last_en_provisional
             or state.status_message != last_status
+            or state.processed_samples != last_processed_samples
         )
         if changed:
             last_ar_verified = state.arabic_verified
@@ -159,6 +172,7 @@ async def _poll_updates(
             last_en_verified = state.english_verified
             last_en_provisional = state.english_provisional
             last_status = state.status_message
+            last_processed_samples = state.processed_samples
             await _send_state(websocket, state, phase="listening")
 
         await asyncio.sleep(WS_POLL_SEC)
@@ -199,9 +213,11 @@ async def get_config() -> dict[str, Any]:
 
 
 @app.put("/config")
-async def put_config(body: ConfigUpdate) -> dict[str, Any]:
-    if not is_ready() and ready_error() and "Reloading" not in (ready_error() or ""):
-        raise HTTPException(status_code=503, detail=ready_error() or "Not ready")
+async def put_config(body: ConfigUpdate, request: Request) -> dict[str, Any]:
+    if request.client and request.client.host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(status_code=403, detail="Model controls are local-only.")
+    if request.headers.get("origin") and request.headers["origin"] not in CORS_ORIGINS:
+        raise HTTPException(status_code=403, detail="Model control origin is not allowed.")
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -222,13 +238,26 @@ async def put_config(body: ConfigUpdate) -> dict[str, Any]:
 
 @app.websocket("/ws")
 async def interpreter_socket(websocket: WebSocket) -> None:
+    mode = websocket.query_params.get("mode", "live")
+    if mode == "simulated":
+        # The demo implementation is deliberately isolated from model imports.
+        from .demo_server import interpreter_socket as scripted_socket
+        await scripted_socket(websocket)
+        return
+    if mode != "live":
+        await websocket.close(code=1008, reason="Unknown demo mode")
+        return
     if not is_ready():
         await websocket.close(code=1013, reason="Models not ready")
         return
 
     await websocket.accept()
-    store = get_store()
-    state = store.create()
+    try:
+        store, state = create_session()
+    except RuntimeError as exc:
+        await websocket.send_json({"type": "error", "status": str(exc), "phase": "error"})
+        await websocket.close(code=1013, reason=str(exc))
+        return
     session_id = state.session_id
     short_id = session_id[:8]
     metrics.session_start()
@@ -252,24 +281,62 @@ async def interpreter_socket(websocket: WebSocket) -> None:
                 break
 
             if "bytes" in message and message["bytes"]:
-                samples = np.frombuffer(message["bytes"], dtype=np.int16)
-                store.append_chunk(session_id, 16_000, samples)
-                continue
+                raw_bytes = message["bytes"]
+                if len(raw_bytes) > MAX_FRAME_BYTES or len(raw_bytes) % 2:
+                    await websocket.send_json({"type": "error", "status": "Invalid audio frame.", "phase": "error"})
+                    outcome = "fail"
+                    break
+                samples = np.frombuffer(raw_bytes, dtype=np.int16)
+                current = store.append_chunk(session_id, 16_000, samples)
+                if current is not None and current.duration_sec() >= 30.0:
+                    message = {"text": '{"type":"stop"}'}
+                else:
+                    continue
 
             if "text" not in message:
                 continue
 
-            payload = json.loads(message["text"])
+            try:
+                payload = json.loads(message["text"])
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "status": "Invalid message.", "phase": "error"})
+                outcome = "fail"
+                break
+            if not isinstance(payload, dict):
+                await websocket.send_json({"type": "error", "status": "Invalid message.", "phase": "error"})
+                outcome = "fail"
+                break
             msg_type = payload.get("type")
 
             if msg_type == "audio":
-                raw = base64.b64decode(payload.get("data", ""))
+                try:
+                    raw = base64.b64decode(payload.get("data", ""), validate=True)
+                except (ValueError, TypeError):
+                    await websocket.send_json({"type": "error", "status": "Invalid audio frame.", "phase": "error"})
+                    outcome = "fail"
+                    break
                 if not raw:
                     continue
+                if len(raw) > MAX_FRAME_BYTES or len(raw) % 2:
+                    await websocket.send_json({"type": "error", "status": "Audio frame too large.", "phase": "error"})
+                    outcome = "fail"
+                    break
                 samples = np.frombuffer(raw, dtype=np.int16)
                 sample_rate = int(payload.get("rate", 16_000))
-                store.append_chunk(session_id, sample_rate, samples)
-            elif msg_type == "stop":
+                if sample_rate not in ALLOWED_RATES:
+                    await websocket.send_json({"type": "error", "status": "Unsupported microphone sample rate.", "phase": "error"})
+                    outcome = "fail"
+                    break
+                if samples.size > sample_rate:
+                    await websocket.send_json({"type": "error", "status": "Audio frame exceeds one second.", "phase": "error"})
+                    outcome = "fail"
+                    break
+                current = store.append_chunk(session_id, sample_rate, samples)
+                if current is not None and current.duration_sec() >= 30.0:
+                    msg_type = "stop"
+                else:
+                    continue
+            if msg_type == "stop":
                 current = store.get(session_id)
                 if current is None or current.audio.size == 0:
                     await websocket.send_json(
@@ -295,7 +362,7 @@ async def interpreter_socket(websocket: WebSocket) -> None:
 
                 await _send_progress(
                     websocket,
-                    "Finalizing: loading high-quality model…",
+                    "Finalizing the full recording…",
                     phase="finalize_load",
                 )
 
@@ -346,6 +413,10 @@ async def interpreter_socket(websocket: WebSocket) -> None:
                 break
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
+            else:
+                await websocket.send_json({"type": "error", "status": "Unknown message.", "phase": "error"})
+                outcome = "fail"
+                break
     except WebSocketDisconnect:
         logger.info(
             "WebSocket disconnected",

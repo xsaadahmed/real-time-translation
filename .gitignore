@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 
 models/
+work/
 outputs/
 *.wav
 !samples/*.wav
@@ -15,4 +16,5 @@ outputs/
 
 production-ui/node_modules/
 production-ui/.next/
+production-ui/*.tsbuildinfo
 production-ui/public/runtime-config.json

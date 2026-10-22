@@ -56,6 +56,8 @@ LIVE_CONTEXT_SEC = _env_float("LIVE_CONTEXT_SEC", 3.0)
 #: Processor-loop tick. Bounds how late a ready chunk starts decoding. Costs
 #: no extra ASR work, unlike the window above, so keep it small.
 LIVE_POLL_SEC = _env_float("LIVE_POLL_SEC", 0.05)
+MAX_SESSION_SEC = _env_float("LIVE_MAX_SESSION_SEC", 30.0)
+SILENCE_RMS = _env_float("LIVE_SILENCE_RMS", 0.001)
 
 
 @dataclass
@@ -76,6 +78,9 @@ class LiveStreamState:
     is_active: bool = False
     last_process_wall: float = 0.0
     chunks_received: int = 0
+    decoded_duration_sec: float = 0.0
+    decode_seconds: float = 0.0
+    silence_rechecked: bool = False
     #: Arabic behind the current english_provisional, so an unchanged tail is
     #: not retranslated on every pass.
     provisional_source: str = ""
@@ -106,16 +111,9 @@ def merge_audio(
     new_mono = resample(to_mono_float32(new_samples), sample_rate, ASR_SAMPLE_RATE)
     if new_mono.size == 0:
         return existing
-    if existing.size == 0:
-        return new_mono
-    if new_mono.size > existing.size:
-        return new_mono
-    if new_mono.size == existing.size:
-        probe = min(800, existing.size)
-        if probe > 0 and np.allclose(existing[:probe], new_mono[:probe], atol=0.02):
-            return existing
-        return np.concatenate([existing, new_mono])
-    return np.concatenate([existing, new_mono])
+    # Browser WebSocket frames are deltas, not cumulative recordings. Never
+    # guess otherwise from frame size or waveform equality: that loses speech.
+    return np.concatenate([existing, new_mono]) if existing.size else new_mono
 
 
 class LiveSessionStore:
@@ -178,17 +176,16 @@ class LiveSessionStore:
             return None
 
         before = state.duration_sec()
-        state.audio = merge_audio(state.audio, samples, sample_rate)
+        remaining = max(0, int(MAX_SESSION_SEC * ASR_SAMPLE_RATE) - state.audio.size)
+        incoming = resample(to_mono_float32(samples), sample_rate, ASR_SAMPLE_RATE)[:remaining]
+        state.audio = np.concatenate([state.audio, incoming]) if incoming.size else state.audio
         state.sample_rate = ASR_SAMPLE_RATE
         state.chunks_received += 1
         after = state.duration_sec()
 
-        logger.info(
-            "Chunk #%d: %.2fs -> %.2fs total",
-            state.chunks_received,
-            before,
-            after,
-        )
+        logger.info("Audio chunk received: %.2fs -> %.2fs total", before, after)
+        if remaining == 0 or state.audio.size >= int(MAX_SESSION_SEC * ASR_SAMPLE_RATE):
+            state.status_message = "Recording limit reached — press Stop to finalize."
         return state
 
     def start_processor(self, session_id: str) -> None:
@@ -274,6 +271,11 @@ class LiveSessionStore:
             state.status_message = f"Listening… ({state.duration_sec():.1f}s captured)"
             return state
 
+        if float(np.sqrt(np.mean(np.square(chunk)))) < SILENCE_RMS:
+            state.processed_samples = chunk_end
+            state.status_message = "Listening… no speech detected yet."
+            return state
+
         state.status_message = f"Transcribing… ({state.duration_sec():.1f}s captured)"
 
         with self._process_lock:
@@ -334,17 +336,13 @@ class LiveSessionStore:
             f"Live — {state.duration_sec():.1f}s recorded · "
             f"chunk {chunk_sec:.1f}s · ASR {asr_s:.1f}s · MT {mt_s:.1f}s"
         )
-        logger.info(
-            "Live increment %.1fs chunk -> Arabic: %s",
-            chunk_sec,
-            state.arabic_text[:120],
-        )
+        logger.info("Live increment complete: chunk %.1fs", chunk_sec)
         return state
 
     def _run_final(self, state: LiveStreamState) -> LiveStreamState:
         """Full-buffer pass with the high-quality model."""
         duration = state.duration_sec()
-        state.status_message = f"Finalizing {duration:.1f}s with high-quality model…"
+        state.status_message = f"Finalizing {duration:.1f}s…"
 
         with self._process_lock:
             final_pipeline = self._get_final_pipeline()
@@ -367,7 +365,7 @@ class LiveSessionStore:
             state.status_message = (
                 f"Done — {duration:.1f}s · ASR {asr_s:.1f}s · MT {mt_s:.1f}s"
             )
-            logger.info("Final transcript: %s", arabic_text[:200])
+            logger.info("Final transcription complete: %.1fs", duration)
         else:
             state.status_message = f"No speech detected in {duration:.1f}s"
 

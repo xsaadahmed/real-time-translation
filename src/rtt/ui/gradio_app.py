@@ -38,19 +38,18 @@ _last_result: dict[str, str] = {
 def _ui_config(config: PipelineConfig | None = None) -> PipelineConfig:
     cfg = config or PipelineConfig()
     cfg.asr.vad_filter = False
-    if os.environ.get("RTT_MT_BACKEND") is None and cfg.mt.backend == "marian":
-        cfg.mt.backend = "nllb"
-        cfg.mt.model_name = ""
     return cfg
 
 
 def _live_config() -> PipelineConfig:
-    """Fast ASR + Marian MT for incremental live updates on CPU."""
+    """One CPU model profile for context-preserving drafts and Stop."""
     cfg = _ui_config()
-    default_live = "base" if detect_device() == "cpu" else "small"
+    default_live = "small"
     cfg.asr.model_size = os.environ.get("RTT_LIVE_ASR_MODEL", default_live)
-    cfg.asr.beam_size = 1
-    cfg.asr.condition_on_previous_text = False
+    cfg.asr.beam_size = 3
+    cfg.asr.condition_on_previous_text = True
+    cfg.asr.num_workers = 1
+    cfg.asr.cpu_threads = 4
     cfg.asr.initial_prompt = ""
     # Single temperature on the live path: a fallback re-decode costs more
     # latency than the marginal quality is worth when the final pass will
@@ -62,21 +61,18 @@ def _live_config() -> PipelineConfig:
     cfg.mt.backend = live_mt
     if live_mt == "marian":
         cfg.mt.model_name = ""
+    else:
+        raise ValueError("The exhibition translation backend must be Marian.")
+    cfg.mt.device = "cpu"
+    cfg.mt.torch_threads = 4
     cfg.mt.num_beams = min(cfg.mt.num_beams, 2)
-    cfg.mt.max_new_tokens = min(cfg.mt.max_new_tokens, 128)
+    cfg.mt.max_new_tokens = 256
     return cfg
 
 
 def _final_config() -> PipelineConfig:
-    """Accurate ASR + higher beam MT for the final pass."""
-    cfg = _ui_config()
-    if not os.environ.get("RTT_ASR_MODEL"):
-        cfg.asr.model_size = "medium"
-    cfg.asr.beam_size = max(cfg.asr.beam_size, 5)
-    cfg.asr.condition_on_previous_text = True
-    cfg.mt.num_beams = max(cfg.mt.num_beams, 6)
-    cfg.mt.max_new_tokens = max(cfg.mt.max_new_tokens, 512)
-    return cfg
+    """Exhibition final pass reuses the reviewed live model profile."""
+    return _live_config()
 
 
 def _get_final_pipeline() -> TranslationPipeline:
@@ -95,7 +91,7 @@ def _get_final_pipeline() -> TranslationPipeline:
 
 
 def get_store() -> LiveSessionStore:
-    global _store, _live_pipeline, _config
+    global _store, _live_pipeline, _final_pipeline, _config
     if _store is not None:
         return _store
 
@@ -109,12 +105,13 @@ def get_store() -> LiveSessionStore:
                 live_cfg.asr.beam_size,
                 live_cfg.mt.backend,
             )
-            _live_pipeline = build_pipeline(live_cfg, include_tts=False)
-            _store = LiveSessionStore(
-                _live_pipeline, _get_final_pipeline, _config.second_opinion, _config.vad
-            )
+            pipeline = build_pipeline(live_cfg, include_tts=False)
             logger.info("Warming up live pipeline…")
-            _live_pipeline.warmup()
+            pipeline.warmup()
+            _live_pipeline = pipeline
+            _final_pipeline = pipeline
+            from ..live.context_session import ContextSessionStore
+            _store = ContextSessionStore(pipeline)
     return _store
 
 

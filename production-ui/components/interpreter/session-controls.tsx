@@ -10,76 +10,30 @@ type Props = {
   onChange: (patch: { live_asr?: string; final_asr?: string; live_mt?: string }) => void
 }
 
-function Select({
-  label,
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  label: string
-  value: string
-  options: string[]
-  disabled: boolean
-  onChange: (value: string) => void
-}) {
-  return (
-    <label className="flex flex-col gap-1 text-[11px] tracking-wide text-hint">
-      <span>{label}</span>
-      <select
-        value={value}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
-        className="max-w-[9.5rem] cursor-pointer border-0 border-b border-border bg-transparent py-1 text-xs text-ink outline-none transition-colors hover:border-hint focus:border-ink disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        {options.map((opt) => (
-          <option key={opt} value={opt}>
-            {opt}
-          </option>
-        ))}
-      </select>
-    </label>
-  )
+const LABELS: Record<string, string> = {
+  tiny: 'Tiny', base: 'Base', small: 'Small · recommended', medium: 'Medium',
+  'large-v3-turbo': 'Large turbo', 'large-v3': 'Large v3',
 }
 
-/**
- * Optional live/final model selectors. Language pair is fixed Arabic → English.
- */
 export function SessionControls({ config, busy, error, disabled, onChange }: Props) {
-  if (!config) return null
-
-  const locked = disabled || busy
-
+  const selected = config?.loading_model || config?.live_asr || 'small'
+  const larger = ['medium', 'large-v3-turbo', 'large-v3'].includes(selected)
   return (
-    <div className="flex flex-col items-end gap-2">
-      <div className="flex flex-wrap items-end justify-end gap-4 md:gap-6">
-        <p className="pb-1 text-[11px] tracking-wide text-hint">
-          {config.source_lang.toUpperCase()} → {config.target_lang.toUpperCase()}
-        </p>
-        <Select
-          label="Live ASR"
-          value={config.live_asr}
-          options={config.options.live_asr}
-          disabled={locked}
-          onChange={(live_asr) => onChange({ live_asr })}
-        />
-        <Select
-          label="Live MT"
-          value={config.live_mt}
-          options={config.options.live_mt}
-          disabled={locked}
-          onChange={(live_mt) => onChange({ live_mt })}
-        />
-        <Select
-          label="Final ASR"
-          value={config.final_asr}
-          options={config.options.final_asr}
-          disabled={locked}
-          onChange={(final_asr) => onChange({ final_asr })}
-        />
-      </div>
-      {busy && <p className="text-[11px] text-hint">Reloading models…</p>}
-      {error && <p className="max-w-xs text-right text-[11px] text-destructive">{error}</p>}
+    <div className="flex max-w-xs flex-col items-end gap-1.5">
+      <label className="flex items-center gap-2 text-xs text-hint">
+        <span>Speech model</span>
+        <select aria-label="Speech model size" value={selected}
+          disabled={!config || disabled || busy || Boolean(config.loading_model)}
+          onChange={(event) => onChange({ live_asr: event.target.value })}
+          className="cursor-pointer rounded-md border border-border bg-paper px-2 py-1.5 text-xs text-ink outline-none focus-visible:ring-1 focus-visible:ring-ink disabled:cursor-wait disabled:opacity-50">
+          {(config?.options.live_asr ?? ['small']).map((size) => (
+            <option key={size} value={size}>{LABELS[size] ?? size}</option>
+          ))}
+        </select>
+      </label>
+      {busy && <p role="status" className="text-right text-xs text-hint">Loading model… first use may download weights.</p>}
+      {larger && !busy && <p className="text-right text-xs text-hint">More RAM and slower updates on CPU. First use downloads weights.</p>}
+      {error && <p role="alert" className="text-right text-xs text-destructive">{error}</p>}
     </div>
   )
 }

@@ -4,8 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 const DEFAULT_WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://127.0.0.1:8765/ws'
 const MIC_CHUNK_MS = 500
-const MAX_RECONNECT_ATTEMPTS = 3
-const RECONNECT_BASE_MS = 800
+export type DemoMode = 'live' | 'simulated'
 
 function sameOriginWsUrl(): string | null {
   if (typeof window === 'undefined') return null
@@ -93,6 +92,11 @@ export type RuntimeConfig = {
   live_mt: string
   final_asr: string
   final_mt: string
+  modes?: DemoMode[]
+  loading_model?: string | null
+  model_error?: string | null
+  error?: string | null
+  finalize_timeout_sec?: number
   options: {
     live_asr: string[]
     final_asr: string[]
@@ -188,6 +192,7 @@ export function useInterpreterStream() {
   const [configBusy, setConfigBusy] = useState(false)
   const [configError, setConfigError] = useState<string | null>(null)
   const [serverReady, setServerReady] = useState<boolean | null>(null)
+  const [mode, setMode] = useState<DemoMode>('live')
 
   const runningRef = useRef(false)
   const intentionalStopRef = useRef(false)
@@ -202,8 +207,14 @@ export function useInterpreterStream() {
   const pcmBufferRef = useRef<Float32Array[]>([])
   const pcmSamplesRef = useRef(0)
   const micStartedRef = useRef(false)
+  const micGenerationRef = useRef(0)
+  const finalizingRef = useRef(false)
+  const finalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const finalizeTimeoutRef = useRef(45_000)
+  const configBusyRef = useRef(false)
 
   const stopMic = useCallback(() => {
+    micGenerationRef.current += 1
     processorRef.current?.disconnect()
     processorRef.current = null
     audioCtxRef.current?.close()
@@ -218,6 +229,10 @@ export function useInterpreterStream() {
   const sendAudioChunk = useCallback((floatSamples: Float32Array, sampleRate: number) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
+    if (ws.bufferedAmount > 512 * 1024) {
+      ws.close(1000, 'Audio connection too slow')
+      return
+    }
 
     const int16 = new Int16Array(floatSamples.length)
     for (let i = 0; i < floatSamples.length; i++) {
@@ -234,14 +249,25 @@ export function useInterpreterStream() {
 
   const startMic = useCallback(async () => {
     if (micStartedRef.current) return
+    const generation = micGenerationRef.current
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     })
+    if (generation !== micGenerationRef.current || !runningRef.current) {
+      stream.getTracks().forEach((track) => track.stop())
+      return
+    }
     mediaStreamRef.current = stream
 
     const ctx = new AudioContext()
     audioCtxRef.current = ctx
+    await ctx.resume()
+    if (generation !== micGenerationRef.current || !runningRef.current) {
+      stream.getTracks().forEach((track) => track.stop())
+      void ctx.close()
+      return
+    }
     const source = ctx.createMediaStreamSource(stream)
     const processor = ctx.createScriptProcessor(4096, 1, 1)
     processorRef.current = processor
@@ -274,6 +300,9 @@ export function useInterpreterStream() {
   }, [sendAudioChunk])
 
   const closeSocket = useCallback(() => {
+    if (finalTimerRef.current) clearTimeout(finalTimerRef.current)
+    finalTimerRef.current = null
+    finalizingRef.current = false
     const ws = wsRef.current
     wsRef.current = null
     if (ws) {
@@ -295,6 +324,18 @@ export function useInterpreterStream() {
 
   const handleMessage = useCallback((msg: ServerPayload) => {
     if (msg.type === 'pong') return
+    if (msg.type === 'progress' && msg.finalizing && runningRef.current) {
+      // The server also finalizes automatically at the recording limit.
+      runningRef.current = false
+      finalizingRef.current = true
+      setRunning(false)
+      stopMic()
+      finalTimerRef.current = setTimeout(() => {
+        closeSocket()
+        setState((prev) => ({ ...prev, finalizing: false, phase: 'error',
+          error: 'Processing timed out. Your draft is preserved.' }))
+      }, finalizeTimeoutRef.current)
+    }
     if (msg.type === 'update' || msg.type === 'final' || msg.type === 'progress' || msg.type === 'error') {
       setState((prev) => applyPayload(prev, msg))
     }
@@ -316,7 +357,10 @@ export function useInterpreterStream() {
   }, [closeSocket, stopMic])
 
   const connectSocket = useCallback(async (opts: { reconnect: boolean }) => {
-    const wsUrl = wsUrlRef.current || (await resolveWsUrl())
+    const rawWsUrl = wsUrlRef.current || (await resolveWsUrl())
+    const url = new URL(rawWsUrl)
+    url.searchParams.set('mode', mode)
+    const wsUrl = url.toString()
     wsUrlRef.current = wsUrl
     apiBaseRef.current = apiBaseFromWs(wsUrl)
 
@@ -337,26 +381,9 @@ export function useInterpreterStream() {
 
     ws.onclose = () => {
       wsRef.current = null
-      if (!runningRef.current || intentionalStopRef.current) return
-
-      if (reconnectAttemptRef.current < MAX_RECONNECT_ATTEMPTS) {
-        const attempt = reconnectAttemptRef.current + 1
-        reconnectAttemptRef.current = attempt
-        const delay = RECONNECT_BASE_MS * 2 ** (attempt - 1)
-        setState((prev) => ({
-          ...prev,
-          reconnecting: true,
-          connecting: false,
-          phase: 'reconnecting',
-          status: `Connection lost — reconnecting (${attempt}/${MAX_RECONNECT_ATTEMPTS})…`,
-          error: null,
-        }))
-        clearReconnectTimer()
-        reconnectTimerRef.current = setTimeout(() => {
-          void connectSocket({ reconnect: true })
-        }, delay)
-        return
-      }
+      if (!runningRef.current && !finalizingRef.current) return
+      if (finalTimerRef.current) clearTimeout(finalTimerRef.current)
+      finalizingRef.current = false
 
       runningRef.current = false
       setRunning(false)
@@ -367,8 +394,8 @@ export function useInterpreterStream() {
         reconnecting: false,
         finalizing: false,
         phase: 'error',
-        error: 'Connection lost. Check that the translation server is running, then try again.',
-        status: '',
+        error: 'Connection lost. The session was interrupted; start a new one.',
+        status: 'Interrupted',
       }))
     }
 
@@ -383,7 +410,7 @@ export function useInterpreterStream() {
         error: null,
       }))
       try {
-        await startMic()
+        if (mode === 'live') await startMic()
       } catch {
         runningRef.current = false
         intentionalStopRef.current = true
@@ -399,7 +426,7 @@ export function useInterpreterStream() {
         }))
       }
     }
-  }, [clearReconnectTimer, closeSocket, handleMessage, startMic, stopMic])
+  }, [clearReconnectTimer, closeSocket, handleMessage, mode, startMic, stopMic])
 
   const refreshConfig = useCallback(async () => {
     try {
@@ -415,7 +442,9 @@ export function useInterpreterStream() {
       if (!res.ok) return
       const data = (await res.json()) as RuntimeConfig
       setConfig(data)
-      setConfigError(null)
+      finalizeTimeoutRef.current = (data.finalize_timeout_sec ?? 45) * 1000
+      setServerReady(data.ready)
+      setConfigError(data.model_error ?? null)
     } catch {
       setServerReady(false)
     }
@@ -423,11 +452,13 @@ export function useInterpreterStream() {
 
   const updateConfig = useCallback(
     async (patch: { live_asr?: string; final_asr?: string; live_mt?: string }) => {
-      if (runningRef.current) {
+      if (runningRef.current || finalizingRef.current || configBusyRef.current) {
         setConfigError('Stop the session before changing models.')
         return
       }
       setConfigBusy(true)
+      configBusyRef.current = true
+      setServerReady(false)
       setConfigError(null)
       try {
         const base =
@@ -447,18 +478,22 @@ export function useInterpreterStream() {
         }
         const data = (await res.json()) as RuntimeConfig
         setConfig(data)
-        setServerReady(true)
+        setServerReady(data.ready)
+        finalizeTimeoutRef.current = (data.finalize_timeout_sec ?? 45) * 1000
       } catch (err) {
         setConfigError(err instanceof Error ? err.message : 'Could not update models.')
       } finally {
         setConfigBusy(false)
+        configBusyRef.current = false
+        void refreshConfig()
       }
     },
-    [],
+    [refreshConfig],
   )
 
   const start = useCallback(async () => {
-    if (runningRef.current) return
+    if (runningRef.current || finalizingRef.current) return
+    if (mode === 'live' && configBusyRef.current) return
 
     clearReconnectTimer()
     intentionalStopRef.current = false
@@ -477,7 +512,11 @@ export function useInterpreterStream() {
       wsUrlRef.current = wsUrl
       apiBaseRef.current = apiBaseFromWs(wsUrl)
 
-      // Wait briefly if API is still loading models
+      // Simulation is always available; live waits briefly for local models.
+      if (mode === 'simulated') {
+        await connectSocket({ reconnect: false })
+        return
+      }
       try {
         const readyRes = await fetch(`${apiBaseRef.current}/ready`, { cache: 'no-store' })
         if (!readyRes.ok) {
@@ -516,14 +555,26 @@ export function useInterpreterStream() {
         error: 'Could not open WebSocket connection.',
       })
     }
-  }, [clearReconnectTimer, connectSocket])
+  }, [clearReconnectTimer, connectSocket, mode])
 
   const stop = useCallback(() => {
     if (!runningRef.current) return
 
     intentionalStopRef.current = true
     clearReconnectTimer()
+    // Send the last partial chunk before releasing capture. Dropping this
+    // tail clips words exactly where sentence context matters most.
+    if (pcmSamplesRef.current && audioCtxRef.current) {
+      const tail = new Float32Array(pcmSamplesRef.current)
+      let offset = 0
+      for (const part of pcmBufferRef.current) {
+        tail.set(part, offset)
+        offset += part.length
+      }
+      sendAudioChunk(tail, audioCtxRef.current.sampleRate)
+    }
     runningRef.current = false
+    finalizingRef.current = true
     setRunning(false)
     stopMic()
     setState((prev) => ({
@@ -532,12 +583,17 @@ export function useInterpreterStream() {
       reconnecting: false,
       connecting: false,
       phase: 'finalizing',
-      status: 'Finalizing with high-quality model…',
+      status: mode === 'simulated' ? 'Completing scripted preview…' : 'Finalizing…',
     }))
 
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'stop' }))
+      finalTimerRef.current = setTimeout(() => {
+        closeSocket()
+        setState((prev) => ({ ...prev, finalizing: false, phase: 'error',
+          error: 'Processing timed out. Your draft is preserved; start a new session.' }))
+      }, finalizeTimeoutRef.current)
     } else {
       closeSocket()
       setState((prev) => ({
@@ -547,7 +603,7 @@ export function useInterpreterStream() {
         error: 'Lost connection before finalize.',
       }))
     }
-  }, [clearReconnectTimer, closeSocket, stopMic])
+  }, [clearReconnectTimer, closeSocket, mode, sendAudioChunk, stopMic])
 
   const reset = useCallback(() => {
     intentionalStopRef.current = true
@@ -563,7 +619,7 @@ export function useInterpreterStream() {
     void refreshConfig()
     const id = setInterval(() => {
       void refreshConfig()
-    }, 15_000)
+    }, 2_000)
     return () => clearInterval(id)
   }, [refreshConfig])
 
@@ -583,11 +639,15 @@ export function useInterpreterStream() {
     stop,
     reset,
     config,
-    configBusy,
+    configBusy: configBusy || Boolean(config?.loading_model),
     configError,
     serverReady,
     updateConfig,
     refreshConfig,
+    mode,
+    setMode: (next: DemoMode) => {
+      if (!runningRef.current) setMode(next)
+    },
     ...state,
   }
 }

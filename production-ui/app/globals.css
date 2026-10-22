@@ -57,7 +57,7 @@
   --foreground: oklch(0.145 0 0);
   /* near-black confirmed ink, soft-but-legible prediction grey, faint hint grey */
   --ink: oklch(0.18 0 0);
-  --prediction: oklch(0.74 0 0);
+  --prediction: oklch(0.5 0 0);
   --hint: oklch(0.6 0 0);
   --paper: oklch(1 0 0);
   --card: oklch(1 0 0);

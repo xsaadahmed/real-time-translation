@@ -132,7 +132,7 @@ class MTConfig:
 
     # "marian"  -> Helsinki-NLP/opus-mt-ar-en  (~300 MB, fast on CPU)
     # "nllb"    -> facebook/nllb-200-distilled-600M (~2.4 GB, better, slower)
-    backend: str = field(default_factory=lambda: _env("MT_BACKEND", "nllb"))
+    backend: str = field(default_factory=lambda: _env("MT_BACKEND", "marian"))
     model_name: str = field(default_factory=lambda: _env("MT_MODEL", ""))
     device: str = field(default_factory=lambda: _env("MT_DEVICE", "auto"))
     num_beams: int = field(default_factory=lambda: _env_int("MT_BEAMS", 4))
@@ -143,7 +143,7 @@ class MTConfig:
     )
     # NLLB FLORES code. apc_Arab = North Levantine (Lebanon/Syria); arb_Arab = MSA.
     nllb_source_code: str = field(
-        default_factory=lambda: _env("NLLB_SOURCE_LANG", "apc_Arab")
+        default_factory=lambda: _env("NLLB_SOURCE_LANG", "arb_Arab")
     )
     cache_dir: str = field(default_factory=lambda: _env("MT_CACHE_DIR", str(MODEL_DIR / "mt")))
 
